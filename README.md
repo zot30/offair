@@ -32,7 +32,7 @@ Plex.
 ## Set up
 
 ```bash
-git clone <this repository> ~/offair && cd ~/offair
+git clone https://github.com/zot30/offair.git ~/offair && cd ~/offair
 
 # 1. Your settings
 mkdir -p ~/.config/offair
