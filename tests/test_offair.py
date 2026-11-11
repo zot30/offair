@@ -30,6 +30,7 @@ def load():
     m.WORK_DIR = os.path.join(tmp, "work")
     m.STATE_FILE = os.path.join(tmp, "state", "state.json")
     m.REQUESTS_DIR = os.path.join(tmp, "state", "requests")
+    m.AD_REQUESTS_DIR = os.path.join(tmp, "state", "ad-requests")
     m.LOG_FILE = os.path.join(tmp, "offair.log")
     m.LOCK_DIR = os.path.join(m.WORK_DIR, "run.lock")
     m.FFMPEG_LOG = os.path.join(m.WORK_DIR, "ffmpeg-last.log")
@@ -373,6 +374,29 @@ class StatusPage(Base):
         self.assertTrue(self.s.request_convert(m.rel(src)))
         self.assertEqual(self.kicks, [("kickstart",)])
         self.assertEqual(list(m.read_requests()), [m.request_key(src)])
+
+    def test_ads_can_be_requested_for_filed_recordings_only(self):
+        m = self.m
+        m.PLEX_ADS = True
+        m.save_state({"files": {
+            "Show/a.mpeg": {"status": "done", "filed": "TV/Show/Season 1/Show - S01E01.mp4", "ads": "none found"},
+            "Show/b.mpeg": {"status": "done", "filed": "no, already in library: TV/x.mp4"},
+            "Show/c.mpeg": {"status": "done", "filed": "TV/Show/Season 1/Show - S01E03.mp4", "ads": "pending"}}})
+        text = self.s.page(self.s.snapshot())
+        self.assertIn('value="Show/a.mpeg"', text)                 # offered again: a rescan
+        self.assertNotIn('value="Show/b.mpeg"', text)              # not in the library
+        self.assertNotIn('value="Show/c.mpeg"', text)              # already waiting
+        self.assertFalse(self.s.request_ads(["Show/b.mpeg", "nonsense"]))
+        self.assertEqual(self.kicks, [])
+        self.assertTrue(self.s.request_ads(["Show/a.mpeg", "Show/b.mpeg"]))
+        self.assertEqual(self.kicks, [("kickstart",)])
+        state = m.load_state()
+        self.assertEqual(m.take_ad_requests(state), 1)
+        self.assertEqual(state["files"]["Show/a.mpeg"]["ads"], "pending")
+        self.assertNotIn("ads", state["files"]["Show/b.mpeg"])
+        self.assertEqual(os.listdir(m.AD_REQUESTS_DIR), [])
+        m.PLEX_ADS = False
+        self.assertNotIn('class="pick"', self.s.page(self.s.snapshot()))
 
 
 if __name__ == "__main__":

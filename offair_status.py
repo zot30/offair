@@ -116,7 +116,7 @@ def snapshot():
             if not snap["share"] or os.path.exists(mp4):
                 snap["attention"].append((key, "converted but not filed: " + filed[4:]))
     done = [(e.get("converted_at", ""), k, e) for k, e in files.items() if e.get("status") == "done"]
-    snap["recent"] = sorted(done, reverse=True)[:RECENT]
+    snap["recent"] = sorted(done, reverse=True)
     snap["total"] = len(done)
     return snap
 
@@ -148,6 +148,10 @@ td.act { text-align:right; white-space:nowrap; padding-right:0; }
 button { font:inherit; font-size:13px; color:#fff; background:var(--btn); border:0; border-radius:6px;
          padding:4px 12px; cursor:pointer; }
 button.stop { background: var(--bad); }
+button:disabled { opacity:.45; cursor:default; }
+h2 .act { float:right; font-weight:400; font-size:13px; }
+input[type=checkbox] { margin:0 8px 0 0; }
+a { color: var(--btn); }
 pre { margin:0; font:12px/1.5 ui-monospace, Menlo, monospace; white-space:pre-wrap; word-break:break-word; }
 form { display:inline; margin:0; }
 """
@@ -179,7 +183,25 @@ def rows(items, action=None):
     return "".join(out)
 
 
-def page(snap):
+SCRIPT = """
+var boxes = document.querySelectorAll('input.pick'), all = document.getElementById('all'),
+    go = document.getElementById('go');
+function update() {
+  var n = document.querySelectorAll('input.pick:checked').length;
+  go.disabled = !n;
+  go.textContent = n ? 'Detect ads in ' + n + ' selected' : 'Detect ads in selected';
+}
+if (go) {
+  boxes.forEach(function (b) { b.onchange = update; });
+  all.onchange = function () { boxes.forEach(function (b) { b.checked = all.checked; }); update(); };
+  update();
+}
+// Refresh every minute, but not while you're part-way through choosing.
+setInterval(function () { if (!document.querySelector('input.pick:checked')) location.reload(); }, 60000);
+"""
+
+
+def page(snap, show_all=False):
     pills = []
     if snap["problems"]:
         pills.append('<span class="pill bad">Settings need fixing</span>')
@@ -224,22 +246,35 @@ def page(snap):
                 % (esc(name(k)), esc(n), "" if k in snap["requests"] or "requested" in n
                    else button("convert", "Convert now", k)) for k, n in waiting))
             if waiting else '<span class="dim">Nothing is waiting to be converted.</span>'))
+    plex = core.PLEX_ADS and not snap["problems"]
+    listed = snap["recent"] if show_all else snap["recent"][:RECENT]
+
+    def pick(k, e):
+        if not plex or e.get("ads") == "pending" or not e.get("filed") or e["filed"].startswith("no"):
+            return ""
+        return '<input type="checkbox" class="pick" form="ads" name="key" value="%s">' % esc(k)
     recent = "".join(
-        '<tr><td>%s</td><td>%s</td><td class="dim">%s</td><td class="dim">%s</td></tr>'
-        % (esc(name(k)), esc(when(e.get("converted_at"))),
+        '<tr><td><label>%s%s</label></td><td>%s</td><td class="dim">%s</td><td class="dim">%s</td></tr>'
+        % (pick(k, e), esc(name(k)), esc(when(e.get("converted_at"))),
            esc(e["filed"]) if e.get("filed") and not e["filed"].startswith("no") else
            ("not filed" if e.get("filed") else "beside the recording"),
            "waiting for Plex to scan for ads" if e.get("ads") == "pending" else esc(e["ads"])
            if "ads" in e else "" if "ad_breaks" not in e else "%d ad break(s)" % e["ad_breaks"])
-        for _, k, e in snap["recent"])
-    body.append('<div class="card"><h2>Converted (latest %d of %d)</h2><table><tr><th>Recording</th>'
+        for _, k, e in listed)
+    more = "" if len(listed) == snap["total"] else ' · <a href="/?all=1">show all</a>'
+    if show_all and snap["total"] > RECENT:
+        more = ' · <a href="/">show latest %d</a>' % RECENT
+    body.append('<div class="card"><h2>Converted (%d of %d%s)%s</h2><table><tr><th>%sRecording</th>'
                 '<th>Converted</th><th>Filed as</th><th>Ads</th></tr>%s</table></div>'
-                % (len(snap["recent"]), snap["total"], recent))
+                % (len(listed), snap["total"], more,
+                   '<span class="act"><form id="ads" method="post" action="/ads"><button id="go" disabled>'
+                   'Detect ads in selected</button></form></span>' if plex else "",
+                   '<input type="checkbox" id="all" title="Select all">' if plex else "", recent))
     body.append('<div class="card"><h2>Log</h2><pre>%s</pre></div>' % esc("\n".join(snap["log"])))
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Offair</title>'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            '<meta http-equiv="refresh" content="60"><style>%s</style></head><body><main>%s</main>'
-            '</body></html>' % (CSS, "".join(body)))
+            '<style>%s</style></head><body><main>%s</main><script>%s</script>'
+            '</body></html>' % (CSS, "".join(body), SCRIPT))
 
 
 # ---------------------------------------------------------------- actions --
@@ -260,13 +295,29 @@ def request_convert(key):
     return True
 
 
+def request_ads(keys):
+    """Ask for Plex's ad detection on converted recordings (state keys) and start the
+    job. Returns False if none of them is a filed recording."""
+    files = core.load_state()["files"]
+    keys = [k for k in keys if files.get(k, {}).get("filed") and not files[k]["filed"].startswith("no")]
+    if not keys:
+        return False
+    os.makedirs(core.AD_REQUESTS_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".new.", dir=core.AD_REQUESTS_DIR)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(keys) + "\n")
+    os.rename(tmp, os.path.join(core.AD_REQUESTS_DIR, os.path.basename(tmp)[len(".new."):]))
+    launchctl("kickstart")
+    return True
+
+
 def launchctl(*args):
     target = "gui/%d/%s" % (os.getuid(), core.LABEL)
     subprocess.run(["launchctl"] + list(args) + [target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    cache = (0.0, "")
+    cache = (0.0, None)
 
     def local(self):
         """Only this Mac's own browser, on this page: refuses other sites' forms and
@@ -289,13 +340,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.local():
             return self.send(403, "Forbidden")
-        if self.path != "/":
+        if self.path not in ("/", "/?all=1"):
             return self.send(404, "Not found")
-        at, text = Handler.cache
-        if time.time() - at > CACHE_SECONDS:
-            text = page(snapshot())
-            Handler.cache = (time.time(), text)
-        self.send(200, text)
+        at, snap = Handler.cache
+        if snap is None or time.time() - at > CACHE_SECONDS:
+            snap = snapshot()
+            Handler.cache = (time.time(), snap)
+        self.send(200, page(snap, show_all=self.path != "/"))
 
     def do_POST(self):
         if not self.local():
@@ -306,12 +357,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             core.load_config()
             if not request_convert(form.get("key", [""])[0]):
                 return self.send(400, "That isn't a recording in the recordings folder.")
+        elif self.path == "/ads":
+            core.load_config()
+            if not (core.PLEX_ADS and request_ads(form.get("key", []))):
+                return self.send(400, "None of those is a filed recording, or [plex] detect_ads is off.")
         elif self.path == "/stop":
             launchctl("kill", "TERM")
         else:
             return self.send(404, "Not found")
         time.sleep(1)                               # let the job start or stop before the page reloads
-        Handler.cache = (0.0, "")
+        Handler.cache = (0.0, None)
         self.send(303, location="/")
 
     def log_message(self, *args):

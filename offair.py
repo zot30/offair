@@ -60,6 +60,7 @@ NAS_PORT = 445
 WORK_DIR = os.path.join(HOME, "Library/Caches/offair")
 STATE_FILE = os.path.join(HOME, "Library/Application Support/offair/state.json")
 REQUESTS_DIR = os.path.join(HOME, "Library/Application Support/offair/requests")
+AD_REQUESTS_DIR = os.path.join(HOME, "Library/Application Support/offair/ad-requests")
 LOG_FILE = os.path.join(HOME, "Library/Logs/offair.log")
 LOG_MAX_BYTES = 1_000_000          # rotate the log at about 1 MB
 LOG_BACKUPS = 3                    # keep offair.log.1 .. .3
@@ -940,6 +941,33 @@ def plex_start_scan(item):
             plex(prefs, "PUT", enableAdMarkerGeneration=before)
 
 
+def take_ad_requests(state):
+    """Mark the recordings chosen on the status page as waiting for Plex's ad detection.
+    Returns how many there were."""
+    try:
+        names = [n for n in os.listdir(AD_REQUESTS_DIR) if not n.startswith(".")]
+    except FileNotFoundError:
+        return 0
+    asked = 0
+    for n in names:
+        req = os.path.join(AD_REQUESTS_DIR, n)
+        try:
+            with open(req) as f:
+                keys = f.read().splitlines()
+            os.remove(req)
+        except OSError:
+            continue
+        for key in keys:
+            entry = state["files"].get(key, {})
+            if entry.get("filed") and not entry["filed"].startswith("no"):
+                entry["ads"] = "pending"
+                asked += 1
+    if asked:
+        save_state(state)
+        log.info("Ad detection requested for %d recording(s)", asked)
+    return asked
+
+
 def plex_detect_ads(state, keep_going=lambda: True):
     """Have Plex find the ad breaks in newly filed recordings. Whatever goes wrong here
     is logged and tried again next run; it never affects a conversion."""
@@ -963,16 +991,19 @@ def plex_detect_ads(state, keep_going=lambda: True):
                 log.info("Plex hasn't added %s yet; its ad breaks wait for the next run", entry["filed"])
                 continue
             if not keep_going():
-                log.info("Run window has closed; ad detection carries over to the next run")
+                log.info("Run window has opened or closed; ad detection carries over to the next run")
                 return
             item, breaks = plex_item(item_id)
             if not breaks:
                 plex_start_scan(item)
                 log.info("Plex is scanning %s for ad breaks", entry["filed"])
                 deadline = time.time() + max(300, item.get("duration", 0) / 1000 * PLEX_SCAN_FACTOR)
-                while not breaks and time.time() < deadline:
+                while not breaks and time.time() < deadline and keep_going():
                     time.sleep(PLEX_POLL_SECONDS)
                     breaks = plex_item(item_id)[1]
+            if not breaks and not keep_going():
+                log.info("Run window has opened or closed; ad detection carries over to the next run")
+                return
             entry["ads"] = "%d ad break(s)" % breaks if breaks else "none found"
             save_state(state)
             log.info("Plex ad breaks in %s: %s", entry["filed"], entry["ads"])
@@ -990,6 +1021,12 @@ def run(args, state):
     keep_going = lambda: args.force or only_requests or in_window()     # for the Plex step
     if requests:
         log.info("Convert-now request(s): %s", ", ".join(sorted(requests)))
+    if not args.dry_run and take_ad_requests(state) and not (requests or args.force or in_window()):
+        # Asked for on the status page. Plex does the work, so power and the share don't
+        # matter; it stops when the window opens so that it never blocks the nightly run.
+        log.info("Outside run window %s-%s; only asking Plex for ad breaks", RUN_START, RUN_END)
+        plex_detect_ads(state, lambda: not in_window())
+        return 0
 
     def cannot_start(reason):
         log.info("%s; exiting", reason)
@@ -1325,9 +1362,13 @@ def main():
             rc = run(args, load_state())
             # A request made while this run was busy found the job already running.
             new = {f for fs in read_requests().values() for f in fs} - seen
-            if args.dry_run or not new:
+            try:
+                more_ads = any(not n.startswith(".") for n in os.listdir(AD_REQUESTS_DIR))
+            except FileNotFoundError:
+                more_ads = False
+            if args.dry_run or not (new or more_ads):
                 return rc
-            log.info("--- new convert-now request(s) arrived during the run; going again")
+            log.info("--- new request(s) arrived during the run; going again")
     except Exception as e:
         log.exception("Unexpected error")
         notify("Unexpected error: %s" % e)
