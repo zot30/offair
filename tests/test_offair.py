@@ -226,5 +226,74 @@ class EndToEnd(Base):
         self.assertEqual(os.listdir(m.TV_DIR), [])
 
 
+class StalledCopy(Base):
+    def test_copy_file_copies(self):
+        src = os.path.join(self.tmp, "a")
+        with open(src, "wb") as f:
+            f.write(b"x" * 100000)
+        self.m.copy_file(src, src + ".copy")
+        self.assertEqual(os.path.getsize(src + ".copy"), 100000)
+        self.assertIsNone(self.m._copying["what"])
+
+    def test_watchdog_fires_only_when_a_copy_stops_moving(self):
+        import time
+        m, fired = self.m, []
+        m.copy_stalled = fired.append
+        m.COPY_STALL_MINUTES = 1
+        m.watch_copies(interval=0.05)
+        m._copying.update(what="slow.mpeg", at=time.time())        # copying, making progress
+        time.sleep(0.2)
+        self.assertEqual(fired, [])
+        m._copying.update(at=time.time() - 120)                    # no progress for 2 minutes
+        time.sleep(0.2)
+        self.assertEqual(fired[0], "slow.mpeg")
+        m._copying["what"] = None
+
+
+class StatusPage(Base):
+    def setUp(self):
+        super().setUp()
+        import sys
+        sys.path.insert(0, os.path.join(HERE, ".."))
+        import offair_status
+        self.s = offair_status
+        self.s.core = self.m
+        self.m.load_config = lambda path=None: []                  # keep the temp folders
+        self.m.MIN_SIZE_MB = 0
+        self.kicks = []
+        self.s.launchctl = lambda *a: self.kicks.append(a)
+
+    def test_page_lists_waiting_failed_and_converted(self):
+        m = self.m
+        waiting = touch(os.path.join(m.SOURCE_DIR, "Show", "S1_E1_-_Waiting_-_Mon_09_Nov.mpeg"))
+        os.utime(waiting, (0, 0))
+        gave_up = touch(os.path.join(m.SOURCE_DIR, "Show", "S1_E2_-_Broken.mpeg"))
+        os.utime(gave_up, (0, 0))
+        done = touch(os.path.join(m.SOURCE_DIR, "Show", "S1_E3_-_Done.mpeg"))
+        m.save_state({"files": {
+            m.rel(gave_up): {"status": "failed", "failures": 3, "last_error": "no <video> stream"},
+            m.rel(done): {"status": "done", "converted_at": "2026-11-10T05:10:00",
+                          "filed": "TV/Show/Season 1/Show - S01E03 - Done.mp4"}}})
+        snap = self.s.snapshot()
+        self.assertEqual([k for k, _ in snap["waiting"]], [m.rel(waiting)])
+        self.assertEqual([k for k, _ in snap["attention"]], [m.rel(gave_up)])
+        text = self.s.page(snap)
+        for expected in ("Show / S1 E1 - Waiting", "Convert now", "Try again", "no &lt;video&gt; stream",
+                         "Show - S01E03 - Done.mp4", "Idle"):
+            self.assertIn(expected, text)
+        self.assertNotIn("<video>", text)
+
+    def test_convert_request_only_for_real_recordings(self):
+        m = self.m
+        src = touch(os.path.join(m.SOURCE_DIR, "Show", "S1_E1_-_Pilot.mpeg"))
+        touch(os.path.join(self.tmp, "outside.mpeg"))
+        self.assertFalse(self.s.request_convert("../outside.mpeg"))
+        self.assertFalse(self.s.request_convert("Show/missing.mpeg"))
+        self.assertEqual(self.kicks, [])
+        self.assertTrue(self.s.request_convert(m.rel(src)))
+        self.assertEqual(self.kicks, [("kickstart",)])
+        self.assertEqual(list(m.read_requests()), [m.request_key(src)])
+
+
 if __name__ == "__main__":
     unittest.main()

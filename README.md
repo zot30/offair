@@ -48,9 +48,11 @@ open -e ~/.config/offair/config.ini        # set the three folders, and the shar
 # 4. Convert one recording now and look at the result in your media server.
 ./offair.py --force --limit 1
 
-# 5. Install the nightly job and the Finder Quick Action.
+# 5. Install the nightly job, the status page and the Finder Quick Action.
 ./offair.py install
 ```
+
+Then open <http://localhost:8765> to see the status page.
 
 If your folders are on a network share, also do the one-time permission step under
 *Network shares and macOS privacy*. Without it, the nightly job can't read the share.
@@ -101,7 +103,8 @@ To use a different settings file, set `OFFAIR_CONFIG=/path/to/config.ini`.
    it into place.
 6. It files the MP4 into your libraries.
 7. You get a notification only when something needs you: a recording that has failed 3
-   times, the share unreachable 3 nights running, a full disk, or an unexpected error.
+   times, the share unreachable 3 nights running, a full disk, a copy that has hung for
+   10 minutes (the run is stopped and retried next time), or an unexpected error.
 
 On a MacBook Air M4, a 45-minute HD episode takes about 22 minutes, and SD runs about
 ten times faster than real time.
@@ -121,9 +124,28 @@ Recordings are expected in the layout fetchtv-cli saves:
   the log names what it found.
 - Originals stay where they are until `keep_originals = no`.
 
+## Status page
+
+<http://localhost:8765> shows, on this Mac only:
+
+- whether a run is in progress and which recording it's on, with a **Stop this run** button
+- whether the recordings folder is reachable
+- **Needs attention:** recordings that were given up on (with **Try again**), and MP4s
+  that weren't filed because the library already had that episode or film
+- **Waiting:** recordings not yet converted and why, each with **Convert now**
+- the latest 40 conversions and where they were filed
+- the end of the log
+
+The page refreshes every minute. It never converts anything itself: its buttons leave
+a request for the nightly job, exactly like the Quick Action below. Stopping a run
+ends it cleanly, and the recording is tried again next time.
+
+Only this Mac can open the page, and it refuses requests sent from other websites.
+Change the port with `[status] port`, then run `./offair.py install` again.
+
 ## Convert now
 
-To watch something sooner, right-click its recording in Finder and choose
+To watch something sooner, use the status page, or right-click its recording in Finder and choose
 **Quick Actions → Convert now**. It goes ahead of everything else, runs outside the
 window and on battery, and you get a notification when it's filed or has failed. It
 also retries a recording that was given up on.
@@ -186,7 +208,7 @@ permission above is missing.
 | Log | `~/Library/Logs/offair.log` (rotated at 1 MB) |
 | What's been converted, and failures | `~/Library/Application Support/offair/state.json` |
 | Working files | `~/Library/Caches/offair/` |
-| Nightly job | `~/Library/LaunchAgents/offair.convert.plist` |
+| Nightly job and status page | `~/Library/LaunchAgents/offair.convert.plist`, `offair.status.plist` |
 
 To retry a recording that hit the failure limit, use **Convert now**, or delete its
 entry from `state.json`.

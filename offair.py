@@ -33,6 +33,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 
@@ -104,6 +105,10 @@ DURATION_TOLERANCE = 0.02          # output duration within 2% of the source
 MAX_FAILURES = 3                   # stop trying a file after this many failures
 FFMPEG_TIMEOUT_FACTOR = 4          # kill ffmpeg after 4 x the recording's running time
 SHARE_DOWN_ALERT_NIGHTS = 3        # notify after this many nights in a row without the share
+COPY_STALL_MINUTES = 10            # stop the run if a copy makes no progress for this long
+
+# Status page (offair_status.py), on this Mac only: http://localhost:<port>
+STATUS_PORT = 8765
 
 NOTIFY_TITLE = "Offair"
 
@@ -128,12 +133,13 @@ CONFIG_KEYS = {
               "max_failures": ("MAX_FAILURES", "int")},
     "notifications": {"title": ("NOTIFY_TITLE", "text"),
                       "share_down_nights": ("SHARE_DOWN_ALERT_NIGHTS", "int")},
+    "status": {"port": ("STATUS_PORT", "int")},
 }
 
 # ------------------------------------------------------------------------------
 
 LABEL = "offair.convert"
-AGENT_PLIST = os.path.join(HOME, "Library/LaunchAgents", LABEL + ".plist")
+STATUS_LABEL = "offair.status"
 QUICK_ACTION = "Convert now.workflow"
 PYTHON = "/usr/bin/python3"        # Apple's, so its path and privacy permission never change
 # The same PATH for launchd and Terminal runs: Homebrew (Apple silicon, then Intel), then macOS.
@@ -540,6 +546,46 @@ def pick_streams(streams):
     return video[0], (preferred or audio)[0]
 
 
+_copying = {"what": None, "at": 0.0}
+
+
+def copy_file(src, dst):
+    """Copy src to dst in chunks, noting progress as it goes, so that watch_copies can
+    tell a slow copy from one that has hung (which a network share can do forever)."""
+    _copying["at"], _copying["what"] = time.time(), src
+    try:
+        with open(src, "rb") as fin, open(dst, "wb") as fout:
+            while True:
+                chunk = fin.read(8 << 20)
+                if not chunk:
+                    break
+                fout.write(chunk)
+                _copying["at"] = time.time()
+    finally:
+        _copying["what"] = None
+
+
+def copy_stalled(what):
+    """A hung copy can't be interrupted, so end the whole run. Nothing counts against the
+    recording; the next run clears the lock and the leftovers and tries it again."""
+    log.error("Copy of %s made no progress for %d minutes; ending this run", what, COPY_STALL_MINUTES)
+    notify("Copying %s stalled, so tonight's run was stopped. It will be tried again next run."
+           % os.path.basename(what))
+    logging.shutdown()
+    release_lock()
+    os._exit(1)
+
+
+def watch_copies(interval=30):
+    def loop():
+        while True:
+            time.sleep(interval)
+            what = _copying["what"]
+            if what and time.time() - _copying["at"] > COPY_STALL_MINUTES * 60:
+                copy_stalled(what)
+    threading.Thread(target=loop, daemon=True).start()
+
+
 def detect_ads(local_src, src_duration):
     """Ad breaks Comskip finds in local_src, as [(start, end)] in seconds. Any problem
     means no breaks: ad detection must never fail a conversion."""
@@ -649,7 +695,7 @@ def convert(src, size, state):
     chapters = os.path.join(WORK_DIR, "chapters.txt")
     breaks = []
     try:
-        shutil.copyfile(src, local_src)
+        copy_file(src, local_src)
         if os.path.getsize(local_src) != size:
             raise FileFailed("copy from NAS was incomplete")
         src_duration, streams = probe(local_src)
@@ -683,7 +729,7 @@ def convert(src, size, state):
         if os.path.exists(partial):
             os.remove(partial)
         try:
-            shutil.copyfile(local, partial)
+            copy_file(local, partial)
         except OSError as e:
             if e.errno == errno.ENOSPC:           # a full disk is not this file's fault
                 raise Stop("no space left in %s for %s" % (os.path.dirname(final), name))
@@ -958,10 +1004,39 @@ def run(args, state):
 
 # ------------------------------------------------------------------ setup --
 
-def agent_loaded():
-    r = subprocess.run(["launchctl", "print", "gui/%d/%s" % (os.getuid(), LABEL)],
+def agent_plist(label):
+    return os.path.join(HOME, "Library/LaunchAgents", label + ".plist")
+
+
+def agent_loaded(label):
+    r = subprocess.run(["launchctl", "print", "gui/%d/%s" % (os.getuid(), label)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return r.returncode == 0
+
+
+def load_agent(label, script, extra):
+    """Write a LaunchAgent that runs script with PYTHON, and (re)load it. True if it loaded."""
+    env = {"PATH": TOOL_PATH}
+    if os.environ.get("OFFAIR_CONFIG"):
+        env["OFFAIR_CONFIG"] = os.path.abspath(CONFIG_FILE)
+    crash_log = os.path.join(os.path.dirname(LOG_FILE), label + ".launchd.log")
+    agent = {"Label": label, "ProgramArguments": [PYTHON, script], "EnvironmentVariables": env,
+             "StandardOutPath": crash_log, "StandardErrorPath": crash_log}
+    agent.update(extra)
+    path = agent_plist(label)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        plistlib.dump(agent, f)
+    domain = "gui/%d" % os.getuid()
+    subprocess.run(["launchctl", "bootout", "%s/%s" % (domain, label)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(10):                      # bootout takes a moment to finish
+        r = subprocess.run(["launchctl", "bootstrap", domain, path], capture_output=True, text=True)
+        if r.returncode == 0:
+            return True
+        time.sleep(0.5)
+    print("Could not load %s: %s" % (label, r.stderr.strip() or r.returncode))
+    return False
 
 
 def check(problems):
@@ -1020,8 +1095,10 @@ def check(problems):
     test(free > 20e9, "%s free on this Mac for working files" % gb(free), "a 2-hour HD film needs about 15 GB")
 
     print("\nNightly job")
-    if test(os.path.exists(AGENT_PLIST), "LaunchAgent installed", "offair.py install"):
-        test(agent_loaded(), "LaunchAgent loaded", "offair.py install")
+    test(os.path.exists(agent_plist(LABEL)) and agent_loaded(LABEL), "nightly job installed and loaded",
+         "offair.py install")
+    test(os.path.exists(agent_plist(STATUS_LABEL)) and agent_loaded(STATUS_LABEL),
+         "status page installed and loaded (http://localhost:%d)" % STATUS_PORT, "offair.py install")
     test(os.path.isdir(os.path.join(HOME, "Library/Services", QUICK_ACTION)),
          "Convert now Quick Action installed", "offair.py install")
     note("window %s-%s, started at %s; originals are %s; ad detection is %s"
@@ -1035,36 +1112,20 @@ def check(problems):
 
 
 def install():
-    """Write the LaunchAgent for the nightly run and load it; install the Quick Action."""
+    """Install (or update) the nightly job, the status page and the Quick Action."""
     here = os.path.dirname(os.path.abspath(__file__))
     hour, minute = (int(x) for x in LAUNCH_AT.split(":"))
-    env = {"PATH": TOOL_PATH}
-    if os.environ.get("OFFAIR_CONFIG"):
-        env["OFFAIR_CONFIG"] = os.path.abspath(CONFIG_FILE)
-    crash_log = os.path.splitext(LOG_FILE)[0] + ".launchd.log"
-    agent = {
-        "Label": LABEL,
-        "ProgramArguments": [PYTHON, os.path.abspath(__file__)],
-        # If the Mac was asleep, launchd runs it on wake and the run window decides.
-        "StartCalendarInterval": {"Hour": hour, "Minute": minute},
-        "EnvironmentVariables": env,
-        # Polite but not throttled: ProcessType=Background slows ffmpeg badly.
-        "Nice": 10,
-        "LowPriorityIO": True,
-        "StandardOutPath": crash_log,
-        "StandardErrorPath": crash_log,
-    }
-    os.makedirs(os.path.dirname(AGENT_PLIST), exist_ok=True)
-    with open(AGENT_PLIST, "wb") as f:
-        plistlib.dump(agent, f)
-    domain = "gui/%d" % os.getuid()
-    subprocess.run(["launchctl", "bootout", "%s/%s" % (domain, LABEL)],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    r = subprocess.run(["launchctl", "bootstrap", domain, AGENT_PLIST], capture_output=True, text=True)
-    if r.returncode != 0:
-        print("Could not load the LaunchAgent: %s" % (r.stderr.strip() or r.returncode))
+    # Nightly: if the Mac was asleep, launchd runs it on wake and the run window decides.
+    # Polite but not throttled: ProcessType=Background slows ffmpeg badly.
+    if not load_agent(LABEL, os.path.join(here, "offair.py"),
+                      {"StartCalendarInterval": {"Hour": hour, "Minute": minute},
+                       "Nice": 10, "LowPriorityIO": True}):
         return 1
-    print("Nightly job installed: runs at %s (%s)" % (LAUNCH_AT, AGENT_PLIST))
+    print("Nightly job installed: runs at %s" % LAUNCH_AT)
+    if not load_agent(STATUS_LABEL, os.path.join(here, "offair_status.py"),
+                      {"RunAtLoad": True, "KeepAlive": True}):
+        return 1
+    print("Status page installed: http://localhost:%d" % STATUS_PORT)
 
     services = os.path.join(HOME, "Library/Services")
     target = os.path.join(services, QUICK_ACTION)
@@ -1077,12 +1138,13 @@ def install():
 
 
 def uninstall():
-    subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LABEL)],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if os.path.exists(AGENT_PLIST):
-        os.remove(AGENT_PLIST)
+    for label in (LABEL, STATUS_LABEL):
+        subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), label)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.path.exists(agent_plist(label)):
+            os.remove(agent_plist(label))
     shutil.rmtree(os.path.join(HOME, "Library/Services", QUICK_ACTION), ignore_errors=True)
-    print("Removed the nightly job and the Quick Action. Settings, state and logs are untouched:")
+    print("Removed the nightly job, the status page and the Quick Action. These are untouched:")
     for path in (CONFIG_FILE, os.path.dirname(STATE_FILE), LOG_FILE, WORK_DIR):
         print("  %s" % path)
     return 0
@@ -1117,6 +1179,7 @@ def main():
     if not acquire_lock():
         log.info("Another run is in progress; exiting")
         return 0
+    watch_copies()
     try:
         log.info("--- start%s%s%s", " (dry run)" if args.dry_run else "",
                  " (force)" if args.force else "",
