@@ -250,6 +250,86 @@ class StalledCopy(Base):
         m._copying["what"] = None
 
 
+class PlexAds(Base):
+    """The Plex step against a stand-in for the server."""
+
+    def setUp(self):
+        super().setUp()
+        m = self.m
+        m.PLEX_ADS, m.PLEX_URL, m.PLEX_POLL_SECONDS, m.PLEX_FIND_MINUTES = True, "http://plex", 0, 0
+        self.calls = []
+        self.library = "1"                  # the library's Ad detection setting
+        self.known = True                   # whether Plex has added the file
+        self.finds_ads = True
+        self.state = {"files": {"Show/S1_E2.mpeg": {
+            "status": "done", "ads": "pending", "filed": "TV/Show/Season 1/Show - S01E02.mp4"}}}
+
+        def plex(path, method="GET", **params):
+            self.calls.append((method, path, params))
+            if path == "/:/prefs":
+                return {"Setting": [{"id": "GenerateAdMarkerBehavior", "value": "scheduled"}]}
+            if path == "/library/sections/3/prefs":
+                if method == "PUT":
+                    self.library = str(params["enableAdMarkerGeneration"])
+                return {"Setting": [{"id": "enableAdMarkerGeneration", "value": self.library}]}
+            if path == "/library/all":
+                self.assertEqual(params, {"type": 4, "file": "Show/Season 1/Show - S01E02.mp4"})
+                return {"Metadata": [{"ratingKey": "7", "Media": [{"Part": [
+                    {"file": "/volume1/tv/Show/Season 1/Show - S01E02.mp4"}]}]}] if self.known else []}
+            if path == "/library/metadata/7/addetect":
+                self.assertEqual(self.library, "2")
+                self.scanned = True
+                return {}
+            if path == "/library/metadata/7":
+                done = getattr(self, "scanned", False) and self.finds_ads
+                return {"Metadata": [{"ratingKey": "7", "librarySectionID": 3, "duration": 1000,
+                                      "Marker": [{"type": "intro"}] + [{"type": "commercial"}] * 3 * done}]}
+            raise OSError("unexpected " + path)
+        m.plex = plex
+
+    def test_scan_is_requested_with_the_setting_on_only_for_the_request(self):
+        self.m.plex_detect_ads(self.state)
+        self.assertEqual(self.state["files"]["Show/S1_E2.mpeg"]["ads"], "3 ad break(s)")
+        self.assertEqual(self.library, "1")
+        puts = [(p, q) for meth, p, q in self.calls if meth == "PUT"]
+        self.assertEqual([p for p, _ in puts], ["/library/sections/3/prefs",
+                                                "/library/metadata/7/addetect",
+                                                "/library/sections/3/prefs"])
+
+    def test_setting_is_put_back_when_the_request_fails(self):
+        real = self.m.plex
+
+        def failing(path, method="GET", **params):
+            if path.endswith("/addetect"):
+                raise OSError("server went away")
+            return real(path, method, **params)
+        self.m.plex = failing
+        self.m.plex_detect_ads(self.state)                   # logs it and carries on
+        self.assertEqual(self.library, "1")
+        self.assertEqual(self.state["files"]["Show/S1_E2.mpeg"]["ads"], "pending")
+
+    def test_not_in_plex_yet_stays_pending(self):
+        self.known = False
+        self.m.plex_detect_ads(self.state)
+        self.assertEqual(self.state["files"]["Show/S1_E2.mpeg"]["ads"], "pending")
+        self.assertFalse([c for c in self.calls if c[0] == "PUT"])
+
+    def test_no_ads_found(self):
+        self.finds_ads = False
+        self.m.PLEX_SCAN_FACTOR = 0
+        self.m.max = lambda *a: 0                          # no five-minute minimum wait
+        self.m.plex_detect_ads(self.state)
+        self.assertEqual(self.state["files"]["Show/S1_E2.mpeg"]["ads"], "none found")
+
+    def test_off_by_default_and_only_for_pending(self):
+        self.state["files"]["Show/S1_E2.mpeg"]["ads"] = "none found"
+        self.m.plex_detect_ads(self.state)
+        self.m.PLEX_ADS = False
+        self.state["files"]["Show/S1_E2.mpeg"]["ads"] = "pending"
+        self.m.plex_detect_ads(self.state)
+        self.assertEqual(self.calls, [])
+
+
 class StatusPage(Base):
     def setUp(self):
         super().setUp()

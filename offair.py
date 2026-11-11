@@ -110,6 +110,14 @@ COPY_STALL_MINUTES = 10            # stop the run if a copy makes no progress fo
 # Status page (offair_status.py), on this Mac only: http://localhost:<port>
 STATUS_PORT = 8765
 
+# Plex's own ad detection, which gives a Skip Commercials button (see README).
+PLEX_ADS = False
+PLEX_URL = ""                      # e.g. http://nas.local:32400
+PLEX_TOKEN_FILE = os.path.join(HOME, ".config/offair/plex-token")
+PLEX_FIND_MINUTES = 10             # wait this long for Plex to notice newly filed MP4s
+PLEX_SCAN_FACTOR = 2.5             # wait up to 2.5 x the running time for each scan
+PLEX_POLL_SECONDS = 60
+
 NOTIFY_TITLE = "Offair"
 
 # Config file layout: [section] key -> the setting above, and how to read its value.
@@ -134,6 +142,8 @@ CONFIG_KEYS = {
     "notifications": {"title": ("NOTIFY_TITLE", "text"),
                       "share_down_nights": ("SHARE_DOWN_ALERT_NIGHTS", "int")},
     "status": {"port": ("STATUS_PORT", "int")},
+    "plex": {"detect_ads": ("PLEX_ADS", "bool"), "url": ("PLEX_URL", "text"),
+             "token_file": ("PLEX_TOKEN_FILE", "path")},
 }
 
 # ------------------------------------------------------------------------------
@@ -209,6 +219,10 @@ def load_config(path=None):
         problems.append("[folders] tv and movies must be set (or set [files] file_into_library = no)")
     if not SOURCE_EXTENSIONS or not all(e.startswith(".") for e in SOURCE_EXTENSIONS):
         problems.append("[folders] extensions must be a list like .mpeg, .ts")
+    if PLEX_ADS and not PLEX_URL.startswith(("http://", "https://")):
+        problems.append("[plex] url must be set, like http://nas.local:32400, while detect_ads = yes")
+    if PLEX_ADS and not FILE_INTO_LIBRARY:
+        problems.append("[plex] detect_ads needs [files] file_into_library = yes")
     return problems
 
 
@@ -850,12 +864,120 @@ def file_finished(state, dry_run=False):
             os.makedirs(os.path.dirname(target), exist_ok=True)
             os.rename(mp4, target)
             entry["filed"] = media_rel(target)
+            if PLEX_ADS:
+                entry["ads"] = "pending"
             save_state(state)
             log.info("Filed %s -> %s", rel(mp4), media_rel(target))
         except OSError as e:
             log.warning("Could not file %s (%s); will try again next run", rel(mp4), e)
             if not share_ok():
                 return
+
+
+# --------------------------------------------------------------- Plex ads --
+# Plex only scans a library for ads when its "Ad detection" setting is "For all items",
+# and then it scans every item in it during maintenance: days of work for a small NAS.
+# So the setting is switched on for the moment it takes to ask for one recording and
+# then put back. Plex drops requests that queue behind a running scan once the setting
+# is back, so recordings are done one at a time.
+
+def plex(path, method="GET", **params):
+    """Call the Plex server and return the MediaContainer of its answer. Uses Apple's
+    curl, because macOS blocks Python's own sockets on the local network under launchd.
+    The token goes to curl on stdin so it never shows in the process list."""
+    with open(PLEX_TOKEN_FILE) as f:
+        token = f.read().strip()
+    cmd = ["/usr/bin/curl", "-sS", "-f", "-m", "30", "-K", "-", "-X", method, "-G",
+           PLEX_URL.rstrip("/") + path]
+    for k, v in params.items():
+        cmd += ["--data-urlencode", "%s=%s" % (k, v)]
+    r = subprocess.run(cmd, input='header = "X-Plex-Token: %s"\nheader = "Accept: application/json"\n'
+                       % token, capture_output=True, text=True, timeout=60)
+    if r.returncode:
+        raise OSError("Plex %s %s: %s" % (method, path, r.stderr.strip() or r.returncode))
+    try:
+        return json.loads(r.stdout).get("MediaContainer", {})
+    except ValueError:
+        return {}
+
+
+def plex_setting(path, name):
+    for setting in plex(path).get("Setting", []):
+        if setting.get("id") == name:
+            return str(setting.get("value"))
+    raise OSError("Plex has no %s setting at %s" % (name, path))
+
+
+def plex_find(filed):
+    """Plex's id for a filed MP4, or None if Plex hasn't added it yet."""
+    full = os.path.join(os.path.dirname(SOURCE_DIR), filed)
+    is_tv = full.startswith(TV_DIR + os.sep)
+    tail = os.path.relpath(full, TV_DIR if is_tv else MOVIES_DIR)
+    for item in plex("/library/all", type=4 if is_tv else 1, file=tail).get("Metadata", []):
+        for media in item.get("Media", []):
+            for part in media.get("Part", []):
+                if part.get("file", "").replace("\\", "/").endswith("/" + tail):
+                    return item["ratingKey"]
+    return None
+
+
+def plex_item(item_id):
+    """(the item's details, how many ad breaks Plex has marked in it)"""
+    item = plex("/library/metadata/%s" % item_id, includeMarkers=1)["Metadata"][0]
+    return item, len([m for m in item.get("Marker", []) if m.get("type") == "commercial"])
+
+
+def plex_start_scan(item):
+    """Ask Plex to scan one item, with its library's setting on only for the request."""
+    prefs = "/library/sections/%s/prefs" % item["librarySectionID"]
+    before = plex_setting(prefs, "enableAdMarkerGeneration")
+    if before != "2":
+        plex(prefs, "PUT", enableAdMarkerGeneration=2)
+    try:
+        plex("/library/metadata/%s/addetect" % item["ratingKey"], "PUT")
+    finally:
+        if before != "2":
+            plex(prefs, "PUT", enableAdMarkerGeneration=before)
+
+
+def plex_detect_ads(state, keep_going=lambda: True):
+    """Have Plex find the ad breaks in newly filed recordings. Whatever goes wrong here
+    is logged and tried again next run; it never affects a conversion."""
+    def pending():
+        return [(k, e) for k, e in sorted(state["files"].items()) if e.get("ads") == "pending"]
+
+    if not PLEX_ADS or not pending():
+        return
+    try:
+        if plex_setting("/:/prefs", "GenerateAdMarkerBehavior") == "never":
+            log.warning("Plex ad detection is off: set Settings > Library > Generate ad "
+                        "video markers to 'as a scheduled task' on the Plex server")
+            return
+        give_up_finding = time.time() + PLEX_FIND_MINUTES * 60
+        for key, entry in pending():
+            item_id = plex_find(entry["filed"])
+            while not item_id and time.time() < give_up_finding and keep_going():
+                time.sleep(PLEX_POLL_SECONDS)
+                item_id = plex_find(entry["filed"])
+            if not item_id:
+                log.info("Plex hasn't added %s yet; its ad breaks wait for the next run", entry["filed"])
+                continue
+            if not keep_going():
+                log.info("Run window has closed; ad detection carries over to the next run")
+                return
+            item, breaks = plex_item(item_id)
+            if not breaks:
+                plex_start_scan(item)
+                log.info("Plex is scanning %s for ad breaks", entry["filed"])
+                deadline = time.time() + max(300, item.get("duration", 0) / 1000 * PLEX_SCAN_FACTOR)
+                while not breaks and time.time() < deadline:
+                    time.sleep(PLEX_POLL_SECONDS)
+                    breaks = plex_item(item_id)[1]
+            entry["ads"] = "%d ad break(s)" % breaks if breaks else "none found"
+            save_state(state)
+            log.info("Plex ad breaks in %s: %s", entry["filed"], entry["ads"])
+    except (OSError, LookupError, ValueError, subprocess.TimeoutExpired) as e:
+        log.warning("Plex ad detection stopped (%s); will try again next run", e)
 
 
 # ------------------------------------------------------------------- main --
@@ -865,6 +987,7 @@ def run(args, state):
     # A Quick Action request outside the window converts only the requested files.
     only_requests = bool(requests) and not args.force and not in_window()
     nightly = not (args.force or args.dry_run or only_requests)
+    keep_going = lambda: args.force or only_requests or in_window()     # for the Plex step
     if requests:
         log.info("Convert-now request(s): %s", ", ".join(sorted(requests)))
 
@@ -934,6 +1057,7 @@ def run(args, state):
     if not candidates:
         log.info("Nothing to convert (%d file(s) skipped)", len(skipped))
         file_finished(state)
+        plex_detect_ads(state, keep_going)
         return 0
     log.info("%d file(s) to convert", len(candidates))
     for leftover in os.listdir(WORK_DIR):        # from a run that was killed mid-encode
@@ -999,6 +1123,7 @@ def run(args, state):
     finally:
         caffeinate.terminate()
     log.info("Finished: %d converted", done)
+    plex_detect_ads(state, keep_going)
     return 0
 
 
@@ -1094,6 +1219,17 @@ def check(problems):
     free = shutil.disk_usage(WORK_DIR).free
     test(free > 20e9, "%s free on this Mac for working files" % gb(free), "a 2-hour HD film needs about 15 GB")
 
+    if PLEX_ADS:
+        print("\nPlex ad detection")
+        try:
+            behaviour = plex_setting("/:/prefs", "GenerateAdMarkerBehavior")
+            test(True, "Plex answers at %s and accepts the token" % PLEX_URL)
+            test(behaviour != "never", "Plex's 'Generate ad video markers' is on (%s)" % behaviour,
+                 "Plex Settings > Library > Generate ad video markers > as a scheduled task")
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            test(False, "Plex answers at %s and accepts the token (%s)" % (PLEX_URL, e),
+                 "check [plex] url, and that %s holds your Plex token" % PLEX_TOKEN_FILE)
+
     print("\nNightly job")
     test(os.path.exists(agent_plist(LABEL)) and agent_loaded(LABEL), "nightly job installed and loaded",
          "offair.py install")
@@ -1101,7 +1237,7 @@ def check(problems):
          "status page installed and loaded (http://localhost:%d)" % STATUS_PORT, "offair.py install")
     test(os.path.isdir(os.path.join(HOME, "Library/Services", QUICK_ACTION)),
          "Convert now Quick Action installed", "offair.py install")
-    note("window %s-%s, started at %s; originals are %s; ad detection is %s"
+    note("window %s-%s, started at %s; originals are %s; ad-break chapters are %s"
          % (RUN_START, RUN_END, LAUNCH_AT, "kept" if KEEP_ORIGINALS else "deleted after conversion",
             "on" if DETECT_ADS else "off"))
     if MOUNT_POINT:

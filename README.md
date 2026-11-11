@@ -72,6 +72,7 @@ one with an explanation. Only `[folders]` is required.
 | `[schedule]` | The run window and the launch time. |
 | `[encode]` | Deinterlacing, quality, audio, hardware encoder. |
 | `[ads]` | Ad-break chapters (off by default). |
+| `[plex]` | Plex's Skip Commercials button for new recordings (off by default). |
 | `[files]` | Keeping originals, filing, which recordings qualify. |
 | `[notifications]` | Notification title, share-down alert. |
 
@@ -102,7 +103,8 @@ To use a different settings file, set `OFFAIR_CONFIG=/path/to/config.ini`.
 5. It checks the MP4, copies it back as `name.mp4.partial`, checks the size and renames
    it into place.
 6. It files the MP4 into your libraries.
-7. You get a notification only when something needs you: a recording that has failed 3
+7. With `[plex] detect_ads = yes`, it asks Plex to find the ad breaks in what it filed.
+8. You get a notification only when something needs you: a recording that has failed 3
    times, the share unreachable 3 nights running, a full disk, a copy that has hung for
    10 minutes (the run is stopped and retried next time), or an unexpected error.
 
@@ -133,7 +135,7 @@ Recordings are expected in the layout fetchtv-cli saves:
 - **Needs attention:** recordings that were given up on (with **Try again**), and MP4s
   that weren't filed because the library already had that episode or film
 - **Waiting:** recordings not yet converted and why, each with **Convert now**
-- the latest 40 conversions and where they were filed
+- the latest 40 conversions, where they were filed, and their ad breaks
 - the end of the log
 
 The page refreshes every minute. It never converts anything itself: its buttons leave
@@ -154,6 +156,45 @@ If **Convert now** isn't in the menu, turn it on under Quick Actions → Customi
 
 ## Ad breaks
 
+There are two ways to mark ad breaks. Neither cuts anything out.
+
+### Plex's Skip Commercials button
+
+Plex (with Plex Pass) can find ad breaks itself and show a **Skip Commercials** button.
+For libraries that aren't Plex DVR recordings, it only does so with the library's
+**Ad detection** set to *For all items*, and then it scans the whole library during
+maintenance, which takes a small NAS days.
+
+With `[plex] detect_ads = yes`, offair gets the button onto new recordings only. For
+each MP4 it has filed, it waits for Plex to add it, switches that library's Ad
+detection to *For all items* for the moment it takes to request a scan of that one
+item, and switches it straight back. It does one recording at a time, because Plex
+drops requests that are queued behind a running scan. The scan runs on the Plex
+server. On a DS418j a scan took between a fifth of the running time and one and a half
+times it, depending on what else the NAS was doing.
+
+Plex doesn't say when a scan has finished, so offair waits until ad breaks appear, or
+for 2.5 times the running time before recording "none found". A recording with no ads
+therefore holds up the ones after it; any not reached by the end of the run window
+are done on the next run.
+
+To set it up:
+
+1. In Plex, set Settings → Library → **Generate ad video markers** to *as a scheduled
+   task*, and leave each library's **Ad detection** on *For recorded items*.
+2. Save your [Plex token](https://support.plex.tv/articles/204059436) in a file of its
+   own: `pbpaste > ~/.config/offair/plex-token && chmod 600 ~/.config/offair/plex-token`
+3. In `config.ini`, set `[plex] detect_ads = yes` and `url` (for example
+   `http://nas.local:32400`), then run `./offair.py check`.
+
+The status page shows the result for each recording. If Plex is unreachable, or hasn't
+added the file within ten minutes, the recording is tried again on the next run.
+Nothing here can fail a conversion. offair uses Plex's own interface for this and
+writes nothing into Plex's database, but the interface is undocumented and could
+change with a Plex update.
+
+### Chapters with Comskip
+
 With `[ads] detect = yes`, [Comskip](https://github.com/erikkaashoek/Comskip) scans
 each recording and every ad break becomes a chapter called `Ads` in the MP4, with
 `Part 1`, `Part 2`… between them. Nothing is cut out, so a wrong guess costs nothing.
@@ -171,9 +212,6 @@ git apply ~/offair/extras/comskip-ffmpeg8.patch      # only needed with ffmpeg 8
 
 Comskip links against Homebrew's ffmpeg libraries. If it stops working after a major
 ffmpeg upgrade, run `make clean && make && make install` again.
-
-Plex users: Plex can also detect ads itself and show a Skip button (library setting
-**Ad detection**), but it runs on the server and is slow on a small NAS.
 
 ## Network shares and macOS privacy
 

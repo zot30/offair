@@ -229,10 +229,11 @@ def page(snap):
         % (esc(name(k)), esc(when(e.get("converted_at"))),
            esc(e["filed"]) if e.get("filed") and not e["filed"].startswith("no") else
            ("not filed" if e.get("filed") else "beside the recording"),
-           "" if "ad_breaks" not in e else "%d ad break(s)" % e["ad_breaks"])
+           "waiting for Plex to scan for ads" if e.get("ads") == "pending" else esc(e["ads"])
+           if "ads" in e else "" if "ad_breaks" not in e else "%d ad break(s)" % e["ad_breaks"])
         for _, k, e in snap["recent"])
     body.append('<div class="card"><h2>Converted (latest %d of %d)</h2><table><tr><th>Recording</th>'
-                '<th>Converted</th><th>Filed as</th><th></th></tr>%s</table></div>'
+                '<th>Converted</th><th>Filed as</th><th>Ads</th></tr>%s</table></div>'
                 % (len(snap["recent"]), snap["total"], recent))
     body.append('<div class="card"><h2>Log</h2><pre>%s</pre></div>' % esc("\n".join(snap["log"])))
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Offair</title>'
