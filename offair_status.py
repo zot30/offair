@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """offair status page: shows what the nightly job has done and what's waiting or stuck,
-with buttons to convert a recording now or stop a run.
+with buttons to convert a recording now, stop a run, or queue recordings for Plex's ad
+detection.
 
 It serves http://localhost:<port> (see [status] port) to this Mac only. `offair.py
 install` sets it up to run all the time; to try it by hand, run this file.
@@ -78,6 +79,7 @@ def snapshot():
     problems = core.load_config()
     state = core.load_state() if os.path.exists(core.STATE_FILE) else {"files": {}}
     files = state["files"]
+    core.apply_ad_requests(files, core.read_ad_requests())     # show requests the job hasn't read yet
     log_lines = read_log()
     started, summary, current = last_run(log_lines)
     snap = {
@@ -118,6 +120,8 @@ def snapshot():
     done = [(e.get("converted_at", ""), k, e) for k, e in files.items() if e.get("status") == "done"]
     snap["recent"] = sorted(done, reverse=True)
     snap["total"] = len(done)
+    snap["queue"] = sorted(((e.get("ads") != "scanning", k, e) for k, e in files.items()
+                            if e.get("ads") in ("pending", "scanning")), key=lambda q: q[:2])
     return snap
 
 
@@ -152,6 +156,22 @@ button:disabled { opacity:.45; cursor:default; }
 h2 .act { float:right; font-weight:400; font-size:13px; }
 input[type=checkbox] { margin:0 8px 0 0; }
 a { color: var(--btn); }
+button.quiet { background:transparent; color:var(--btn); border:1px solid var(--line); }
+.now { display:flex; align-items:center; gap:12px; flex-wrap:wrap; font-size:17px; }
+.now .dot { width:10px; height:10px; border-radius:50%; background:var(--dim); flex:none; }
+.now.busy .dot { background:var(--ok); animation:pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity:.25; } }
+.badge { display:inline-block; border-radius:999px; padding:1px 10px; font-size:12.5px; white-space:nowrap;
+         border:1px solid var(--line); color:var(--dim); }
+.badge.good { color:var(--ok); border-color:var(--ok); }
+.badge.busy { color:#fff; background:var(--btn); border-color:var(--btn); }
+.badge.queued { color:var(--warn); border-color:var(--warn); }
+.badge.bad { color:var(--bad); border-color:var(--bad); }
+.sub { display:block; font-size:12px; color:var(--dim); word-break:break-word; }
+.tabs { font-size:13px; font-weight:400; margin-left:8px; }
+.tabs b { color:var(--ink); }
+details summary { cursor:pointer; font-weight:600; font-size:16px; }
+details[open] summary { margin-bottom:10px; }
 pre { margin:0; font:12px/1.5 ui-monospace, Menlo, monospace; white-space:pre-wrap; word-break:break-word; }
 form { display:inline; margin:0; }
 """
@@ -190,8 +210,9 @@ function update() {
   var n = document.querySelectorAll('input.pick:checked').length;
   go.disabled = !n;
   go.textContent = n ? 'Detect ads in ' + n + ' selected' : 'Detect ads in selected';
+  all.checked = n > 0 && n === boxes.length;
 }
-if (go) {
+if (go && all) {
   boxes.forEach(function (b) { b.onchange = update; });
   all.onchange = function () { boxes.forEach(function (b) { b.checked = all.checked; }); update(); };
   update();
@@ -201,33 +222,67 @@ setInterval(function () { if (!document.querySelector('input.pick:checked')) loc
 """
 
 
-def page(snap, show_all=False):
-    pills = []
+def ad_badge(entry):
+    """The coloured label for a recording's ad breaks."""
+    ads = entry.get("ads")
+    if ads == "scanning":
+        return '<span class="badge busy">Scanning now</span>'
+    if ads == "pending":
+        return '<span class="badge queued">Queued</span>'
+    if ads == "none found":
+        return '<span class="badge">No ads found</span>'
+    if ads:
+        return '<span class="badge good">%s</span>' % esc(ads.replace("(s)", "s").replace("1 ad breaks", "1 ad break"))
+    if "ad_breaks" in entry:
+        return '<span class="badge good">%d chapter break(s)</span>' % entry["ad_breaks"]
+    return '<span class="badge">Not scanned</span>'
+
+
+def filed_ok(entry):
+    return bool(entry.get("filed")) and not entry["filed"].startswith("no")
+
+
+VIEWS = (("", "latest %d" % RECENT), ("all", "all"), ("unscanned", "not scanned"))
+
+
+def page(snap, view=""):
+    plex = core.PLEX_ADS and not snap["problems"]
+    scanning = [(k, e) for first, k, e in snap["queue"] if not first]
+    queued = [(k, e) for first, k, e in snap["queue"] if first]
+
+    # What is happening right now, in one line.
     if snap["problems"]:
-        pills.append('<span class="pill bad">Settings need fixing</span>')
+        now, busy = "Settings need fixing", False
+    elif snap["pid"] and scanning:
+        now, busy = "Plex is scanning %s for ads (since %s)" % (
+            name(scanning[0][0]), when(scanning[0][1].get("ads_since")).replace("today ", "")), True
     elif snap["pid"]:
-        pills.append('<span class="pill ok">Running: %s</span>' % esc(name(snap["current"]) if snap["current"]
-                                                                       else "starting"))
+        now, busy = ("Converting %s" % name(snap["current"]) if snap["current"] else "Working"), True
     else:
-        pills.append('<span class="pill">Idle</span>')
-    if snap["share"] is not None:
-        down = snap["share_down"] or {}
-        pills.append('<span class="pill ok">Recordings folder reachable</span>' if snap["share"] else
-                     '<span class="pill bad">Recordings folder unreachable%s</span>'
-                     % (" (%d nights)" % down["nights"] if down.get("nights") else ""))
-    pills.append('<span class="pill">Next run %s, window %s–%s</span>'
-                 % (core.LAUNCH_AT, core.RUN_START, core.RUN_END))
-    pills.append('<span class="pill">Originals %s</span>' % ("kept" if core.KEEP_ORIGINALS else "deleted after converting"))
+        now, busy = "Idle. Next run at %s" % core.LAUNCH_AT, False
+    if busy and queued:
+        now += ", %d more queued for ads" % len(queued)
     if snap["started"]:
         last = "Last run started %s" % when(snap["started"])
         if snap["summary"] and not snap["pid"]:
             last += ": " + snap["summary"][0].lower() + snap["summary"][1:]
     else:
         last = "No runs in the log yet"
+    pills = []
+    if snap["share"] is not None:
+        down = snap["share_down"] or {}
+        pills.append('<span class="pill ok">Recordings folder reachable</span>' if snap["share"] else
+                     '<span class="pill bad">Recordings folder unreachable%s</span>'
+                     % (" (%d nights)" % down["nights"] if down.get("nights") else ""))
+    pills.append('<span class="pill">Run window %s–%s</span>' % (core.RUN_START, core.RUN_END))
+    pills.append('<span class="pill">Originals %s</span>' % ("kept" if core.KEEP_ORIGINALS else "deleted after converting"))
+    body = ['<h1>Offair</h1><div class="card"><div class="now%s"><span class="dot"></span><span>%s</span>%s</div>'
+            '<div class="dim" style="margin-top:6px">%s. %d recording(s) converted so far.</div>'
+            '<div class="pills">%s</div></div>'
+            % (" busy" if busy else "", esc(now),
+               button("stop", "Stop this run", css="stop") if snap["pid"] else "",
+               esc(last), snap["total"], "".join(pills))]
 
-    body = ['<h1>Offair</h1><div class="dim">%s. %d recording(s) converted so far.</div>'
-            % (esc(last), snap["total"]), '<div class="pills">%s%s</div>'
-            % ("".join(pills), " " + button("stop", "Stop this run", css="stop") if snap["pid"] else "")]
     if snap["problems"]:
         body.append('<div class="card"><h2 class="bad">Settings (%s)</h2><pre>%s</pre></div>'
                     % (esc(core.CONFIG_FILE), esc("\n".join(snap["problems"]))))
@@ -238,39 +293,66 @@ def page(snap, show_all=False):
                         % (esc(name(k)), esc(note),
                            button("convert", "Try again", k) if note.startswith(("gave up", "failed")) and snap["share"] else "")
                         for k, note in snap["attention"])))
+
+    # The ad queue: what Plex is scanning and what's lined up, each removable.
+    if plex and snap["queue"]:
+        lines = "".join(
+            '<tr><td>%s</td><td>%s</td><td class="act">%s</td></tr>'
+            % (esc(name(k)), ad_badge(e),
+               '<span class="dim">can\'t be interrupted</span>' if e["ads"] == "scanning"
+               else button("ads/remove", "Remove", k, css="quiet"))
+            for _, k, e in snap["queue"])
+        clear = "" if len(queued) < 2 else (
+            '<span class="act"><form method="post" action="/ads/remove">%s<button class="quiet">'
+            'Remove all %d queued</button></form></span>'
+            % ("".join('<input type="hidden" name="key" value="%s">' % esc(k) for k, _ in queued), len(queued)))
+        body.append('<div class="card"><h2>Ad detection queue (%d)%s</h2><table>%s</table>'
+                    '<div class="dim" style="margin-top:8px;font-size:13px">Plex scans one recording at a '
+                    'time. Anything still queued when the run window opens waits for the nightly run.</div></div>'
+                    % (len(snap["queue"]), clear, lines))
+
     if snap["share"]:
-        waiting = [(k, n) for k, n in snap["waiting"]]
-        body.append('<div class="card"><h2>Waiting (%d)</h2>%s</div>' % (len(waiting), (
+        waiting = snap["waiting"]
+        body.append('<div class="card"><h2>Waiting to be converted (%d)</h2>%s</div>' % (len(waiting), (
             "<table>%s</table>" % "".join(
                 '<tr><td>%s</td><td class="dim">%s</td><td class="act">%s</td></tr>'
-                % (esc(name(k)), esc(n), "" if k in snap["requests"] or "requested" in n
+                % (esc(name(k)), esc(n), '<span class="badge queued">Next</span>'
+                   if k in snap["requests"] or "requested" in n
                    else button("convert", "Convert now", k)) for k, n in waiting))
             if waiting else '<span class="dim">Nothing is waiting to be converted.</span>'))
-    plex = core.PLEX_ADS and not snap["problems"]
-    listed = snap["recent"] if show_all else snap["recent"][:RECENT]
+
+    # Converted recordings, with their place in the library and their ad breaks.
+    everything = snap["recent"]
+    listed = {"": everything[:RECENT], "all": everything}.get(
+        view, [r for r in everything if filed_ok(r[2]) and "ads" not in r[2]])
 
     def pick(k, e):
-        if not plex or e.get("ads") == "pending" or not e.get("filed") or e["filed"].startswith("no"):
+        if not plex or not filed_ok(e) or e.get("ads") in ("pending", "scanning"):
             return ""
         return '<input type="checkbox" class="pick" form="ads" name="key" value="%s">' % esc(k)
+
+    def place(e):
+        if filed_ok(e):
+            return '<span class="sub">%s</span>' % esc(e["filed"])
+        return '<span class="sub">%s</span>' % ("not filed: already in the library" if e.get("filed")
+                                                else "beside the recording")
     recent = "".join(
-        '<tr><td><label>%s%s</label></td><td>%s</td><td class="dim">%s</td><td class="dim">%s</td></tr>'
-        % (pick(k, e), esc(name(k)), esc(when(e.get("converted_at"))),
-           esc(e["filed"]) if e.get("filed") and not e["filed"].startswith("no") else
-           ("not filed" if e.get("filed") else "beside the recording"),
-           "waiting for Plex to scan for ads" if e.get("ads") == "pending" else esc(e["ads"])
-           if "ads" in e else "" if "ad_breaks" not in e else "%d ad break(s)" % e["ad_breaks"])
+        '<tr><td><label>%s%s</label>%s</td><td class="dim" style="white-space:nowrap">%s</td>%s</tr>'
+        % (pick(k, e), esc(name(k)), place(e), esc(when(e.get("converted_at"))),
+           '<td class="act">%s</td>' % (ad_badge(e) if filed_ok(e) else "") if plex else "")
         for _, k, e in listed)
-    more = "" if len(listed) == snap["total"] else ' · <a href="/?all=1">show all</a>'
-    if show_all and snap["total"] > RECENT:
-        more = ' · <a href="/">show latest %d</a>' % RECENT
-    body.append('<div class="card"><h2>Converted (%d of %d%s)%s</h2><table><tr><th>%sRecording</th>'
-                '<th>Converted</th><th>Filed as</th><th>Ads</th></tr>%s</table></div>'
-                % (len(listed), snap["total"], more,
+    tabs = " · ".join("<b>%s</b>" % label if v == view else '<a href="/%s">%s</a>' % ("?show=" + v if v else "", label)
+                      for v, label in VIEWS if plex or v != "unscanned")
+    body.append('<div class="card"><h2>Converted <span class="tabs">%s</span>%s</h2>%s</div>'
+                % (tabs,
                    '<span class="act"><form id="ads" method="post" action="/ads"><button id="go" disabled>'
                    'Detect ads in selected</button></form></span>' if plex else "",
-                   '<input type="checkbox" id="all" title="Select all">' if plex else "", recent))
-    body.append('<div class="card"><h2>Log</h2><pre>%s</pre></div>' % esc("\n".join(snap["log"])))
+                   '<table><tr><th>%sRecording</th><th>Converted</th>%s</tr>%s</table>'
+                   % ('<input type="checkbox" id="all" title="Select all">' if plex else "",
+                      '<th style="text-align:right">Ads</th>' if plex else "", recent)
+                   if listed else '<span class="dim">Nothing to show here.</span>'))
+    body.append('<div class="card"><details><summary>Log</summary><pre>%s</pre></details></div>'
+                % esc("\n".join(snap["log"])))
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Offair</title>'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             '<style>%s</style></head><body><main>%s</main><script>%s</script>'
@@ -295,18 +377,19 @@ def request_convert(key):
     return True
 
 
-def request_ads(keys):
-    """Ask for Plex's ad detection on converted recordings (state keys) and start the
-    job. Returns False if none of them is a filed recording."""
+def request_ads(keys, remove=False):
+    """Queue converted recordings (state keys) for Plex's ad detection, or take queued
+    ones off again, and start the job. Returns False if none of them is a filed recording."""
     files = core.load_state()["files"]
-    keys = [k for k in keys if files.get(k, {}).get("filed") and not files[k]["filed"].startswith("no")]
+    keys = [k for k in keys if filed_ok(files.get(k, {}))]
     if not keys:
         return False
     os.makedirs(core.AD_REQUESTS_DIR, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".new.", dir=core.AD_REQUESTS_DIR)
     with os.fdopen(fd, "w") as f:
         f.write("\n".join(keys) + "\n")
-    os.rename(tmp, os.path.join(core.AD_REQUESTS_DIR, os.path.basename(tmp)[len(".new."):]))
+    # Named by the time, so the job applies requests in the order they were made.
+    os.rename(tmp, os.path.join(core.AD_REQUESTS_DIR, "%.6f.%s" % (time.time(), "remove" if remove else "add")))
     launchctl("kickstart")
     return True
 
@@ -340,13 +423,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.local():
             return self.send(403, "Forbidden")
-        if self.path not in ("/", "/?all=1"):
+        views = {"/" + ("?show=" + v if v else ""): v for v, _ in VIEWS}
+        if self.path not in views:
             return self.send(404, "Not found")
         at, snap = Handler.cache
         if snap is None or time.time() - at > CACHE_SECONDS:
             snap = snapshot()
             Handler.cache = (time.time(), snap)
-        self.send(200, page(snap, show_all=self.path != "/"))
+        self.send(200, page(snap, views[self.path]))
 
     def do_POST(self):
         if not self.local():
@@ -357,9 +441,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             core.load_config()
             if not request_convert(form.get("key", [""])[0]):
                 return self.send(400, "That isn't a recording in the recordings folder.")
-        elif self.path == "/ads":
+        elif self.path in ("/ads", "/ads/remove"):
             core.load_config()
-            if not (core.PLEX_ADS and request_ads(form.get("key", []))):
+            if not (core.PLEX_ADS and request_ads(form.get("key", []), remove=self.path != "/ads")):
                 return self.send(400, "None of those is a filed recording, or [plex] detect_ads is off.")
         elif self.path == "/stop":
             launchctl("kill", "TERM")

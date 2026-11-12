@@ -385,16 +385,30 @@ class StatusPage(Base):
         text = self.s.page(self.s.snapshot())
         self.assertIn('value="Show/a.mpeg"', text)                 # offered again: a rescan
         self.assertNotIn('value="Show/b.mpeg"', text)              # not in the library
-        self.assertNotIn('value="Show/c.mpeg"', text)              # already waiting
+        self.assertNotIn('class="pick" form="ads" name="key" value="Show/c.mpeg"', text)   # already queued
         self.assertFalse(self.s.request_ads(["Show/b.mpeg", "nonsense"]))
         self.assertEqual(self.kicks, [])
         self.assertTrue(self.s.request_ads(["Show/a.mpeg", "Show/b.mpeg"]))
         self.assertEqual(self.kicks, [("kickstart",)])
+        # The page shows the request before the job has read it, with a way to take it back.
+        text = self.s.page(self.s.snapshot())
+        self.assertIn("Ad detection queue (2)", text)
+        self.assertIn('action="/ads/remove"', text)
         state = m.load_state()
         self.assertEqual(m.take_ad_requests(state), 1)
         self.assertEqual(state["files"]["Show/a.mpeg"]["ads"], "pending")
         self.assertNotIn("ads", state["files"]["Show/b.mpeg"])
         self.assertEqual(os.listdir(m.AD_REQUESTS_DIR), [])
+        # Taking it off the queue puts back what was known before.
+        self.assertTrue(self.s.request_ads(["Show/a.mpeg", "Show/c.mpeg"], remove=True))
+        self.assertEqual(m.take_ad_requests(state), 2)
+        self.assertEqual(state["files"]["Show/a.mpeg"]["ads"], "none found")
+        self.assertNotIn("ads", state["files"]["Show/c.mpeg"])
+        # A scan that has started stays.
+        state["files"]["Show/c.mpeg"]["ads"] = "scanning"
+        self.assertTrue(self.s.request_ads(["Show/c.mpeg"], remove=True))
+        self.assertEqual(m.take_ad_requests(state), 0)
+        self.assertEqual(state["files"]["Show/c.mpeg"]["ads"], "scanning")
         m.PLEX_ADS = False
         self.assertNotIn('class="pick"', self.s.page(self.s.snapshot()))
 

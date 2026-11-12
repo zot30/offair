@@ -941,40 +941,77 @@ def plex_start_scan(item):
             plex(prefs, "PUT", enableAdMarkerGeneration=before)
 
 
-def take_ad_requests(state):
-    """Mark the recordings chosen on the status page as waiting for Plex's ad detection.
-    Returns how many there were."""
+def read_ad_requests():
+    """The status page's requests, oldest first: [(request file, add or remove, keys)]."""
     try:
-        names = [n for n in os.listdir(AD_REQUESTS_DIR) if not n.startswith(".")]
+        names = sorted(n for n in os.listdir(AD_REQUESTS_DIR) if not n.startswith("."))
     except FileNotFoundError:
-        return 0
-    asked = 0
+        return []
+    found = []
     for n in names:
-        req = os.path.join(AD_REQUESTS_DIR, n)
         try:
-            with open(req) as f:
-                keys = f.read().splitlines()
-            os.remove(req)
+            with open(os.path.join(AD_REQUESTS_DIR, n)) as f:
+                found.append((os.path.join(AD_REQUESTS_DIR, n), not n.endswith(".remove"),
+                              f.read().splitlines()))
         except OSError:
             continue
+    return found
+
+
+def apply_ad_requests(files, requests):
+    """Queue recordings for Plex's ad detection, or take queued ones off again, in
+    files (the state's entries). A scan that has started can't be taken back. Returns
+    how many entries changed."""
+    changed = 0
+    for _, add, keys in requests:
         for key in keys:
-            entry = state["files"].get(key, {})
-            if entry.get("filed") and not entry["filed"].startswith("no"):
+            entry = files.get(key, {})
+            if not entry.get("filed") or entry["filed"].startswith("no"):
+                continue
+            if add and entry.get("ads") not in ("pending", "scanning"):
+                if "ads" in entry:
+                    entry["ads_was"] = entry["ads"]          # put back if it's taken off again
                 entry["ads"] = "pending"
-                asked += 1
-    if asked:
+                changed += 1
+            elif not add and entry.get("ads") == "pending":
+                if "ads_was" in entry:
+                    entry["ads"] = entry.pop("ads_was")
+                else:
+                    del entry["ads"]
+                changed += 1
+    return changed
+
+
+def take_ad_requests(state):
+    """Apply the status page's requests to the state. Returns how many entries changed."""
+    requests = read_ad_requests()
+    changed = apply_ad_requests(state["files"], requests)
+    if changed:
         save_state(state)
-        log.info("Ad detection requested for %d recording(s)", asked)
-    return asked
+        log.info("Ad detection queue changed for %d recording(s)", changed)
+    for req, _, _ in requests:
+        try:
+            os.remove(req)
+        except OSError:
+            pass
+    return changed
 
 
 def plex_detect_ads(state, keep_going=lambda: True):
-    """Have Plex find the ad breaks in newly filed recordings. Whatever goes wrong here
-    is logged and tried again next run; it never affects a conversion."""
-    def pending():
-        return [(k, e) for k, e in sorted(state["files"].items()) if e.get("ads") == "pending"]
+    """Have Plex find the ad breaks in newly filed recordings and any queued on the
+    status page. Whatever goes wrong here is logged and tried again next run; it never
+    affects a conversion."""
+    left = set()                                 # tried in this run
 
-    if not PLEX_ADS or not pending():
+    def queued():
+        # "scanning" is left behind by a run that was stopped while it waited
+        return [(k, e) for k, e in sorted(state["files"].items())
+                if e.get("ads") in ("pending", "scanning") and k not in left]
+
+    if not PLEX_ADS:
+        return
+    take_ad_requests(state)
+    if not queued():
         return
     try:
         if plex_setting("/:/prefs", "GenerateAdMarkerBehavior") == "never":
@@ -982,7 +1019,12 @@ def plex_detect_ads(state, keep_going=lambda: True):
                         "video markers to 'as a scheduled task' on the Plex server")
             return
         give_up_finding = time.time() + PLEX_FIND_MINUTES * 60
-        for key, entry in pending():
+        while True:
+            take_ad_requests(state)              # the queue can change while a scan runs
+            if not queued():
+                return
+            key, entry = queued()[0]
+            left.add(key)
             item_id = plex_find(entry["filed"])
             while not item_id and time.time() < give_up_finding and keep_going():
                 time.sleep(PLEX_POLL_SECONDS)
@@ -996,6 +1038,8 @@ def plex_detect_ads(state, keep_going=lambda: True):
             item, breaks = plex_item(item_id)
             if not breaks:
                 plex_start_scan(item)
+                entry["ads"], entry["ads_since"] = "scanning", now_iso()
+                save_state(state)
                 log.info("Plex is scanning %s for ad breaks", entry["filed"])
                 deadline = time.time() + max(300, item.get("duration", 0) / 1000 * PLEX_SCAN_FACTOR)
                 while not breaks and time.time() < deadline and keep_going():
@@ -1005,6 +1049,8 @@ def plex_detect_ads(state, keep_going=lambda: True):
                 log.info("Run window has opened or closed; ad detection carries over to the next run")
                 return
             entry["ads"] = "%d ad break(s)" % breaks if breaks else "none found"
+            entry.pop("ads_since", None)
+            entry.pop("ads_was", None)
             save_state(state)
             log.info("Plex ad breaks in %s: %s", entry["filed"], entry["ads"])
     except (OSError, LookupError, ValueError, subprocess.TimeoutExpired) as e:
@@ -1021,9 +1067,11 @@ def run(args, state):
     keep_going = lambda: args.force or only_requests or in_window()     # for the Plex step
     if requests:
         log.info("Convert-now request(s): %s", ", ".join(sorted(requests)))
-    if not args.dry_run and take_ad_requests(state) and not (requests or args.force or in_window()):
-        # Asked for on the status page. Plex does the work, so power and the share don't
-        # matter; it stops when the window opens so that it never blocks the nightly run.
+    ad_requests = not args.dry_run and bool(read_ad_requests())
+    if ad_requests and not (requests or args.force or in_window()):
+        # The queue was changed on the status page. Plex does the work, so power and the
+        # share don't matter; it stops when the window opens so that it never blocks the
+        # nightly run.
         log.info("Outside run window %s-%s; only asking Plex for ad breaks", RUN_START, RUN_END)
         plex_detect_ads(state, lambda: not in_window())
         return 0
