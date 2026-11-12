@@ -29,6 +29,8 @@ PY="$VENV/bin/python"
 LOG="$DEST/fetchtv.log"
 JSON=/tmp/fetch-recordings.json
 WANT=/tmp/fetch-wanted.tsv
+REDO=/tmp/fetch-redo.tsv               # recordings offair asked for again ("Convert again")
+REFETCH=/tmp/fetch-refetch.txt
 LOCK=/tmp/fetch-sync.lock
 
 mkdir -p "$DEST"
@@ -46,15 +48,33 @@ fi
 
 $FT --recordings --json > "$JSON" || { echo "Could not list recordings"; exit 1; }
 
-JSON="$JSON" PULL_SHOWS="$PULL_SHOWS" SKIP_SHOWS="$SKIP_SHOWS" NEW_FROM_ID="$NEW_FROM_ID" MIN_MOVIE_MINUTES="$MIN_MOVIE_MINUTES" \
+# offair lists recordings to download again in $DEST/refetch-requests.txt.
+: > "$REDO"; rm -f "$REFETCH"
+if [ "$DRY_RUN" != 1 ] && [ -s "$DEST/refetch-requests.txt" ]; then mv "$DEST/refetch-requests.txt" "$REFETCH"; fi
+
+JSON="$JSON" REDO="$REDO" REFETCH="$REFETCH" FAILED="$DEST/refetch-failed.txt" PULL_SHOWS="$PULL_SHOWS" SKIP_SHOWS="$SKIP_SHOWS" NEW_FROM_ID="$NEW_FROM_ID" MIN_MOVIE_MINUTES="$MIN_MOVIE_MINUTES" \
 $PY - > "$WANT" <<'PYEOF'
-import json, os
+import json, os, re
 text = open(os.environ["JSON"]).read()
 data, _ = json.JSONDecoder().raw_decode(text[text.find("[\n"):])
 pull = {s.strip().lower() for s in os.environ["PULL_SHOWS"].splitlines() if s.strip()}
 skip = {s.strip().lower() for s in os.environ["SKIP_SHOWS"].splitlines() if s.strip()}
 min_secs = int(os.environ["MIN_MOVIE_MINUTES"]) * 60
 new_from = int(os.environ["NEW_FROM_ID"])
+
+def squash(s):                         # compare names by their letters and digits only
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+again = {}
+if os.path.exists(os.environ["REFETCH"]):
+    again = {squash(os.path.splitext(l)[0]): l for l in open(os.environ["REFETCH"]).read().splitlines() if l}
+with open(os.environ["REDO"], "w") as redo:
+    for show in data:
+        for item in show.get("items", []):
+            if again.pop(squash(show["title"] + item["title"]), None):
+                redo.write(show["title"] + "\t" + item["title"] + "\n")
+if again:                              # not on the box any more: tell offair
+    with open(os.environ["FAILED"], "a") as f:
+        f.write("\n".join(again.values()) + "\n")
 for show in data:
     name = show["title"].lower()
     if name in skip:
@@ -67,6 +87,12 @@ for show in data:
         if movie or new or name in pull:
             print(show["title"] + "\t" + item["title"])
 PYEOF
+
+while IFS=$'\t' read -r folder title; do
+  echo "--- again: $folder / $title"
+  $FT --recordings --folder "$folder" --title "$title" --save "$DEST" --overwrite < /dev/null
+done < "$REDO"
+rm -f "$REFETCH"
 
 if [ ! -s "$WANT" ]; then echo "Nothing selected"; exit 0; fi
 echo "Selected:"; cat "$WANT"

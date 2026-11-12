@@ -80,6 +80,12 @@ def snapshot():
     state = core.load_state() if os.path.exists(core.STATE_FILE) else {"files": {}}
     files = state["files"]
     core.apply_ad_requests(files, core.read_ad_requests())     # show requests the job hasn't read yet
+    for _, add, keys in core.read_ad_requests(core.REDO_REQUESTS_DIR):
+        for key in keys:
+            if key in files and add:
+                files[key].setdefault("redo", "requested")
+            elif key in files:
+                files[key].pop("redo", None)
     log_lines = read_log()
     started, summary, current = last_run(log_lines)
     snap = {
@@ -97,6 +103,8 @@ def snapshot():
         for src, size in candidates:
             entry = files.get(core.rel(src), {})
             note = "requested; converting next" if core.request_key(src) in requests else "waiting for the next run"
+            if entry.get("redo"):
+                note = "converting again; " + note
             if entry.get("failures"):
                 note += " (failed %d time(s): %s)" % (entry["failures"], entry.get("last_error", ""))
             snap["waiting"].append((core.rel(src), "%s, %s" % (core.gb(size), note)))
@@ -120,6 +128,9 @@ def snapshot():
     done = [(e.get("converted_at", ""), k, e) for k, e in files.items() if e.get("status") == "done"]
     snap["recent"] = sorted(done, reverse=True)
     snap["total"] = len(done)
+    # Converting again: (key, True if its original has to come from the Fetch box first)
+    snap["redo"] = sorted((k, bool(snap["share"]) and not os.path.exists(os.path.join(core.SOURCE_DIR, k)))
+                          for k, e in files.items() if e.get("redo"))
     snap["queue"] = sorted(((e.get("ads") != "scanning", k, e) for k, e in files.items()
                             if e.get("ads") in ("pending", "scanning")), key=lambda q: q[:2])
     return snap
@@ -205,16 +216,25 @@ def rows(items, action=None):
 
 SCRIPT = """
 var boxes = document.querySelectorAll('input.pick'), all = document.getElementById('all'),
-    go = document.getElementById('go');
+    go = document.getElementById('go'), redo = document.getElementById('redo');
 function update() {
-  var n = document.querySelectorAll('input.pick:checked').length;
-  go.disabled = !n;
-  go.textContent = n ? 'Detect ads in ' + n + ' selected' : 'Detect ads in selected';
+  var n = document.querySelectorAll('input.pick:checked').length,
+      ads = document.querySelectorAll('input.pick:checked:not([data-noads])').length;
+  if (go) {
+    go.disabled = !ads;
+    go.textContent = ads ? 'Detect ads in ' + ads + ' selected' : 'Detect ads in selected';
+  }
+  redo.disabled = !n;
+  redo.textContent = n ? 'Convert ' + n + ' again' : 'Convert again';
   all.checked = n > 0 && n === boxes.length;
 }
-if (go && all) {
+if (redo && all) {
   boxes.forEach(function (b) { b.onchange = update; });
   all.onchange = function () { boxes.forEach(function (b) { b.checked = all.checked; }); update(); };
+  redo.onclick = function () {
+    return confirm('Convert the selected recording(s) again? Each new copy replaces the one in your ' +
+                   'library. If the original was deleted, it is downloaded from the Fetch box again first.');
+  };
   update();
 }
 // Refresh every minute, but not while you're part-way through choosing.
@@ -311,6 +331,15 @@ def page(snap, view=""):
                     'time. Anything still queued when the run window opens waits for the nightly run.</div></div>'
                     % (len(snap["queue"]), clear, lines))
 
+    if snap["redo"]:
+        body.append('<div class="card"><h2>Converting again (%d)</h2><table>%s</table>'
+                    '<div class="dim" style="margin-top:8px;font-size:13px">The new copy replaces the one in '
+                    'your library once it has passed the checks. Until then the old one stays.</div></div>'
+                    % (len(snap["redo"]), "".join(
+                        '<tr><td>%s</td><td><span class="badge queued">%s</span></td><td class="act">%s</td></tr>'
+                        % (esc(name(k)), "Waiting for the Fetch download" if fetch else "Waiting to be converted",
+                           "" if snap["pid"] and snap["current"] == k else button("redo/remove", "Cancel", k, css="quiet"))
+                        for k, fetch in snap["redo"])))
     if snap["share"]:
         waiting = snap["waiting"]
         body.append('<div class="card"><h2>Waiting to be converted (%d)</h2>%s</div>' % (len(waiting), (
@@ -327,9 +356,10 @@ def page(snap, view=""):
         view, [r for r in everything if filed_ok(r[2]) and "ads" not in r[2]])
 
     def pick(k, e):
-        if not plex or not filed_ok(e) or e.get("ads") in ("pending", "scanning"):
+        if e.get("redo"):
             return ""
-        return '<input type="checkbox" class="pick" form="ads" name="key" value="%s">' % esc(k)
+        return '<input type="checkbox" class="pick" form="ads" name="key" value="%s"%s>' % (
+            esc(k), "" if plex and filed_ok(e) and e.get("ads") not in ("pending", "scanning") else " data-noads")
 
     def place(e):
         if filed_ok(e):
@@ -339,16 +369,18 @@ def page(snap, view=""):
     recent = "".join(
         '<tr><td><label>%s%s</label>%s</td><td class="dim" style="white-space:nowrap">%s</td>%s</tr>'
         % (pick(k, e), esc(name(k)), place(e), esc(when(e.get("converted_at"))),
-           '<td class="act">%s</td>' % (ad_badge(e) if filed_ok(e) else "") if plex else "")
+           '<td class="act">%s</td>' % ('<span class="badge queued">Converting again</span>' if e.get("redo")
+                                        else ad_badge(e) if filed_ok(e) else "") if plex else "")
         for _, k, e in listed)
     tabs = " · ".join("<b>%s</b>" % label if v == view else '<a href="/%s">%s</a>' % ("?show=" + v if v else "", label)
                       for v, label in VIEWS if plex or v != "unscanned")
     body.append('<div class="card"><h2>Converted <span class="tabs">%s</span>%s</h2>%s</div>'
                 % (tabs,
-                   '<span class="act"><form id="ads" method="post" action="/ads"><button id="go" disabled>'
-                   'Detect ads in selected</button></form></span>' if plex else "",
+                   '<span class="act"><form id="ads" method="post" action="/ads">%s<button id="redo" '
+                   'class="quiet" formaction="/redo" disabled>Convert again</button></form></span>'
+                   % ('<button id="go" disabled>Detect ads in selected</button> ' if plex else ""),
                    '<table><tr><th>%sRecording</th><th>Converted</th>%s</tr>%s</table>'
-                   % ('<input type="checkbox" id="all" title="Select all">' if plex else "",
+                   % ('<input type="checkbox" id="all" title="Select all">',
                       '<th style="text-align:right">Ads</th>' if plex else "", recent)
                    if listed else '<span class="dim">Nothing to show here.</span>'))
     body.append('<div class="card"><details><summary>Log</summary><pre>%s</pre></details></div>'
@@ -390,6 +422,27 @@ def request_ads(keys, remove=False):
         f.write("\n".join(keys) + "\n")
     # Named by the time, so the job applies requests in the order they were made.
     os.rename(tmp, os.path.join(core.AD_REQUESTS_DIR, "%.6f.%s" % (time.time(), "remove" if remove else "add")))
+    launchctl("kickstart")
+    return True
+
+
+def request_redo(keys, remove=False):
+    """Ask for converted recordings (state keys) to be converted again, or cancel that,
+    and start the job. Returns False if none of them has been converted."""
+    files = core.load_state()["files"]
+    keys = [k for k in keys if files.get(k, {}).get("status") == "done"]
+    if not keys:
+        return False
+    os.makedirs(core.REDO_REQUESTS_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".new.", dir=core.REDO_REQUESTS_DIR)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(keys) + "\n")
+    os.rename(tmp, os.path.join(core.REDO_REQUESTS_DIR, "%.6f.%s" % (time.time(), "remove" if remove else "add")))
+    # A convert-now request for each, so the job acts on it straight away, like the Quick Action.
+    os.makedirs(core.REQUESTS_DIR, exist_ok=True)
+    for i, key in enumerate([] if remove else keys):
+        with open(os.path.join(core.REQUESTS_DIR, "redo-%.6f-%d" % (time.time(), i)), "w") as f:
+            f.write(os.path.join(core.SOURCE_DIR, key) + "\n")
     launchctl("kickstart")
     return True
 
@@ -445,6 +498,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             core.load_config()
             if not (core.PLEX_ADS and request_ads(form.get("key", []), remove=self.path != "/ads")):
                 return self.send(400, "None of those is a filed recording, or [plex] detect_ads is off.")
+        elif self.path in ("/redo", "/redo/remove"):
+            core.load_config()
+            if not request_redo(form.get("key", []), remove=self.path != "/redo"):
+                return self.send(400, "None of those is a converted recording.")
         elif self.path == "/stop":
             launchctl("kill", "TERM")
         else:

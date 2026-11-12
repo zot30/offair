@@ -144,6 +144,7 @@ Recordings are expected in the layout fetchtv-cli saves:
   breaks*, *No ads found*, *Queued*, *Scanning now* or *Not scanned*. Show the latest
   40, all of them, or only those not scanned. Tick recordings and press **Detect ads
   in selected** to queue them
+- **Convert again**, for ticked recordings whose MP4 came out wrong (see below)
 - the log, folded away at the bottom
 
 The page refreshes every minute, except while you have recordings ticked. It never converts anything itself: its buttons leave
@@ -152,6 +153,22 @@ ends it cleanly, and the recording is tried again next time.
 
 Only this Mac can open the page, and it refuses requests sent from other websites.
 Change the port with `[status] port`, then run `./offair.py install` again.
+
+## Convert again
+
+If a converted recording turns out wrong, tick it on the status page and press
+**Convert again**.
+
+- If the original is still in the recordings folder, it is converted straight away.
+- If the original was deleted (`keep_originals = no`), offair adds it to
+  `refetch-requests.txt` in the recordings folder. The download script
+  (`extras/fetch-sync.sh`) downloads it from the Fetch box again on its next run, and
+  offair converts it on the run after that.
+
+The new MP4 replaces the one in your library only after it has passed the checks; until
+then the old one stays. This is the one case where offair overwrites a library file.
+A **Converting again** card shows what's in progress, with **Cancel** for each. If the
+recording is no longer on the box, you get a notification and nothing changes.
 
 ## Convert now
 
@@ -270,7 +287,9 @@ header explains the setup. It chooses what to download; offair converts whatever
 
 Once `keep_originals = no`, offair deletes each recording after converting it.
 fetchtv-cli won't download it again as long as its `fetchtv_save_list.json` is left
-alone.
+alone. The exception is a recording you ask for with **Convert again**: the script
+downloads those with fetchtv's `--overwrite`, which is why the recording must still
+be on the box.
 
 ## Tests
 

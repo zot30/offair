@@ -61,6 +61,11 @@ WORK_DIR = os.path.join(HOME, "Library/Caches/offair")
 STATE_FILE = os.path.join(HOME, "Library/Application Support/offair/state.json")
 REQUESTS_DIR = os.path.join(HOME, "Library/Application Support/offair/requests")
 AD_REQUESTS_DIR = os.path.join(HOME, "Library/Application Support/offair/ad-requests")
+REDO_REQUESTS_DIR = os.path.join(HOME, "Library/Application Support/offair/redo-requests")
+# In the recordings folder, for the download script (see extras/fetch-sync.sh): the
+# recordings to download again, and those it couldn't find on the box.
+REFETCH_LIST = "refetch-requests.txt"
+REFETCH_FAILED = "refetch-failed.txt"
 LOG_FILE = os.path.join(HOME, "Library/Logs/offair.log")
 LOG_MAX_BYTES = 1_000_000          # rotate the log at about 1 MB
 LOG_BACKUPS = 3                    # keep offair.log.1 .. .3
@@ -485,17 +490,18 @@ def choose(state, requests=(), only_requests=False):
         if only_requests and not asked:
             continue
         entry = state["files"].get(rel(src), {})
+        again = bool(entry.get("redo"))            # asked for on the status page
         try:
             st = os.stat(src)
         except OSError as e:
             skipped.append((src, "cannot read: %s" % e))
             continue
-        if os.path.exists(mp4_path(src)):
+        if os.path.exists(mp4_path(src)) and not again:
             reason = "already converted (.mp4 exists)"
-        elif entry.get("status") == "done":
+        elif entry.get("status") == "done" and not again:
             reason = "already converted" + (" and filed as %s" % entry["filed"]
                                             if "filed" in entry else "")
-        elif entry.get("failures", 0) >= MAX_FAILURES and not asked:
+        elif entry.get("failures", 0) >= MAX_FAILURES and not (asked or again):
             reason = "gave up after %d failures: %s" % (entry["failures"], entry.get("last_error", ""))
         elif st.st_size < MIN_SIZE_MB * 1e6:
             reason = "too small (%d MB)" % (st.st_size / 1e6)
@@ -761,11 +767,14 @@ def convert(src, size, state):
             if os.path.exists(path):
                 os.remove(path)
 
+    before = state["files"].get(rel(src), {})
     state["files"][rel(src)] = {
         "status": "done", "converted_at": now_iso(), "encode_minutes": round(elapsed / 60, 1),
         "source_bytes": size, "output_bytes": out_size,
         "encoder": "h264_videotoolbox" if USE_HARDWARE_ENCODER else "libx264",
     }
+    if before.get("redo") and before.get("filed") and not before["filed"].startswith("no"):
+        state["files"][rel(src)]["replace"] = before["filed"]      # converted again: swap it in
     if DETECT_ADS:
         state["files"][rel(src)]["ad_breaks"] = len(breaks)
     save_state(state)
@@ -841,7 +850,8 @@ def library_target(src):
 
 
 def file_finished(state, dry_run=False):
-    """Move converted, checked MP4s from SOURCE_DIR into the libraries. Never overwrites."""
+    """Move converted, checked MP4s from SOURCE_DIR into the libraries. Never overwrites,
+    except to swap in a recording that was converted again from the status page."""
     if not FILE_INTO_LIBRARY:
         return
     for key, entry in sorted(state["files"].items()):
@@ -853,6 +863,11 @@ def file_finished(state, dry_run=False):
             continue                                # moved by hand
         try:
             target, already = library_target(src)
+            old = os.path.join(os.path.dirname(SOURCE_DIR), entry["replace"]) if entry.get("replace") else None
+            if old and already in (old, os.path.dirname(old)):
+                already = None                      # its own earlier copy, which this replaces
+            else:
+                old = None
             if already:
                 log.info("Not filing %s: already in the library as %s", rel(mp4), media_rel(already))
                 if not dry_run:
@@ -863,16 +878,80 @@ def file_finished(state, dry_run=False):
                 log.info("FILE     %s -> %s", rel(mp4), media_rel(target))
                 continue
             os.makedirs(os.path.dirname(target), exist_ok=True)
+            if old and os.path.exists(old):
+                os.remove(old)                      # only now, with the checked MP4 ready to move in
             os.rename(mp4, target)
             entry["filed"] = media_rel(target)
             if PLEX_ADS:
                 entry["ads"] = "pending"
+                if old:
+                    entry["ads_rescan"] = True      # Plex's markers are for the earlier copy
+            entry.pop("replace", None)
             save_state(state)
-            log.info("Filed %s -> %s", rel(mp4), media_rel(target))
+            log.info("%s %s -> %s", "Replaced" if old else "Filed", rel(mp4), media_rel(target))
         except OSError as e:
             log.warning("Could not file %s (%s); will try again next run", rel(mp4), e)
             if not share_ok():
                 return
+
+
+# --------------------------------------------------------- convert again --
+# From the status page. If the original is still in the recordings folder it is simply
+# converted again. If it was deleted, its name goes on a list in the recordings folder
+# that the download script reads (see extras/fetch-sync.sh), and it is converted when
+# the recording arrives. Either way the new MP4 replaces the one in the library.
+
+def edit_refetch_list(key, add):
+    path = os.path.join(SOURCE_DIR, REFETCH_LIST)
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    lines = [l for l in lines if l != key] + ([key] if add else [])
+    if lines:
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def take_redo_requests(state):
+    """Apply the status page's convert-again requests, and hear back from the download
+    script about recordings that are no longer on the box."""
+    requests = read_ad_requests(REDO_REQUESTS_DIR)
+    try:
+        for _, add, keys in requests:
+            for key in keys:
+                entry = state["files"].get(key, {})
+                if add and entry.get("status") == "done" and not entry.get("redo"):
+                    if not os.path.exists(os.path.join(SOURCE_DIR, key)):
+                        edit_refetch_list(key, True)
+                        log.info("Convert again: asked the download script for %s", key)
+                    else:
+                        log.info("Convert again: %s", key)
+                    entry["redo"] = now_iso()
+                elif not add and entry.get("redo"):
+                    edit_refetch_list(key, False)
+                    del entry["redo"]
+                    log.info("Convert again cancelled: %s", key)
+        failed = os.path.join(SOURCE_DIR, REFETCH_FAILED)
+        if os.path.exists(failed):
+            with open(failed) as f:
+                gone = [k for k in f.read().splitlines() if state["files"].get(k, {}).pop("redo", None)]
+            os.remove(failed)
+            if gone:
+                notify("Can't convert again, no longer on the Fetch box: %s"
+                       % ", ".join(os.path.basename(k) for k in gone))
+    except OSError as e:
+        log.warning("Could not apply convert-again requests (%s); will try again next run", e)
+        return
+    save_state(state)
+    for req, _, _ in requests:
+        try:
+            os.remove(req)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------- Plex ads --
@@ -923,9 +1002,10 @@ def plex_find(filed):
 
 
 def plex_item(item_id):
-    """(the item's details, how many ad breaks Plex has marked in it)"""
+    """(the item's details, the ad breaks Plex has marked in it as (start, end) pairs)"""
     item = plex("/library/metadata/%s" % item_id, includeMarkers=1)["Metadata"][0]
-    return item, len([m for m in item.get("Marker", []) if m.get("type") == "commercial"])
+    return item, [(m.get("startTimeOffset"), m.get("endTimeOffset"))
+                  for m in item.get("Marker", []) if m.get("type") == "commercial"]
 
 
 def plex_start_scan(item):
@@ -941,17 +1021,18 @@ def plex_start_scan(item):
             plex(prefs, "PUT", enableAdMarkerGeneration=before)
 
 
-def read_ad_requests():
+def read_ad_requests(folder=None):
     """The status page's requests, oldest first: [(request file, add or remove, keys)]."""
+    folder = folder or AD_REQUESTS_DIR
     try:
-        names = sorted(n for n in os.listdir(AD_REQUESTS_DIR) if not n.startswith("."))
+        names = sorted(n for n in os.listdir(folder) if not n.startswith("."))
     except FileNotFoundError:
         return []
     found = []
     for n in names:
         try:
-            with open(os.path.join(AD_REQUESTS_DIR, n)) as f:
-                found.append((os.path.join(AD_REQUESTS_DIR, n), not n.endswith(".remove"),
+            with open(os.path.join(folder, n)) as f:
+                found.append((os.path.join(folder, n), not n.endswith(".remove"),
                               f.read().splitlines()))
         except OSError:
             continue
@@ -1036,21 +1117,22 @@ def plex_detect_ads(state, keep_going=lambda: True):
                 log.info("Run window has opened or closed; ad detection carries over to the next run")
                 return
             item, breaks = plex_item(item_id)
-            if not breaks:
+            stale = breaks if entry.get("ads_rescan") else []     # markers from a replaced copy
+            if not breaks or stale:
                 plex_start_scan(item)
                 entry["ads"], entry["ads_since"] = "scanning", now_iso()
                 save_state(state)
                 log.info("Plex is scanning %s for ad breaks", entry["filed"])
                 deadline = time.time() + max(300, item.get("duration", 0) / 1000 * PLEX_SCAN_FACTOR)
-                while not breaks and time.time() < deadline and keep_going():
+                while (not breaks or breaks == stale) and time.time() < deadline and keep_going():
                     time.sleep(PLEX_POLL_SECONDS)
                     breaks = plex_item(item_id)[1]
-            if not breaks and not keep_going():
+            if (not breaks or breaks == stale) and not keep_going():
                 log.info("Run window has opened or closed; ad detection carries over to the next run")
                 return
-            entry["ads"] = "%d ad break(s)" % breaks if breaks else "none found"
-            entry.pop("ads_since", None)
-            entry.pop("ads_was", None)
+            entry["ads"] = "%d ad break(s)" % len(breaks) if breaks else "none found"
+            for done_with in ("ads_since", "ads_was", "ads_rescan"):
+                entry.pop(done_with, None)
             save_state(state)
             log.info("Plex ad breaks in %s: %s", entry["filed"], entry["ads"])
     except (OSError, LookupError, ValueError, subprocess.TimeoutExpired) as e:
@@ -1067,12 +1149,14 @@ def run(args, state):
     keep_going = lambda: args.force or only_requests or in_window()     # for the Plex step
     if requests:
         log.info("Convert-now request(s): %s", ", ".join(sorted(requests)))
-    ad_requests = not args.dry_run and bool(read_ad_requests())
-    if ad_requests and not (requests or args.force or in_window()):
+    page_requests = not args.dry_run and bool(read_ad_requests() or read_ad_requests(REDO_REQUESTS_DIR))
+    if page_requests and not (requests or args.force or in_window()):
         # The queue was changed on the status page. Plex does the work, so power and the
         # share don't matter; it stops when the window opens so that it never blocks the
         # nightly run.
-        log.info("Outside run window %s-%s; only asking Plex for ad breaks", RUN_START, RUN_END)
+        log.info("Outside run window %s-%s; only applying status page requests", RUN_START, RUN_END)
+        if nas_reachable() and (share_mounted() or mount_share()) and os.path.isdir(SOURCE_DIR):
+            take_redo_requests(state)
         plex_detect_ads(state, lambda: not in_window())
         return 0
 
@@ -1115,12 +1199,19 @@ def run(args, state):
                "Privacy & Security (see the offair README).")
         return 0
 
+    if not args.dry_run:
+        take_redo_requests(state)
     candidates, skipped, clashes = choose(state, requests, only_requests)
     chosen = {request_key(src) for src, _ in candidates}
     reasons = {request_key(src): reason for src, reason in skipped}
+    for key, entry in state["files"].items():      # converting again, original deleted
+        if entry.get("redo") and not os.path.exists(os.path.join(SOURCE_DIR, key)):
+            reasons[unicodedata.normalize("NFC", key)] = (
+                "it will be downloaded from the Fetch box again first, then converted")
     for key in sorted(set(requests) - chosen):
-        finish_request(requests, key, "Not converting %s: %s" % (
-            os.path.basename(key), reasons.get(key, "it isn't a recording in the recordings folder")))
+        finish_request(requests, key, "Not converting %s%s: %s" % (
+            os.path.basename(key), " yet" if "downloaded from the Fetch box" in reasons.get(key, "") else "",
+            reasons.get(key, "it isn't a recording in the recordings folder")))
     for path in clashes:
         log.warning("Skipping %s: its name differs from another only in case", rel(path))
     if clashes and not args.dry_run:

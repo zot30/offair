@@ -31,6 +31,7 @@ def load():
     m.STATE_FILE = os.path.join(tmp, "state", "state.json")
     m.REQUESTS_DIR = os.path.join(tmp, "state", "requests")
     m.AD_REQUESTS_DIR = os.path.join(tmp, "state", "ad-requests")
+    m.REDO_REQUESTS_DIR = os.path.join(tmp, "state", "redo-requests")
     m.LOG_FILE = os.path.join(tmp, "offair.log")
     m.LOCK_DIR = os.path.join(m.WORK_DIR, "run.lock")
     m.FFMPEG_LOG = os.path.join(m.WORK_DIR, "ffmpeg-last.log")
@@ -227,6 +228,83 @@ class EndToEnd(Base):
         self.assertEqual(os.listdir(m.TV_DIR), [])
 
 
+class ConvertAgain(EndToEnd):
+    """Converting a recording again from the status page."""
+
+    test_convert_and_file = test_originals_deleted_when_asked = None     # EndToEnd's own tests
+    test_broken_recording_fails_without_filing = None
+
+    def args(self):
+        return argparse.Namespace(dry_run=False, force=True, limit=None)
+
+    def request(self, key, kind="add"):
+        os.makedirs(self.m.REDO_REQUESTS_DIR, exist_ok=True)
+        with open(os.path.join(self.m.REDO_REQUESTS_DIR, "1." + kind), "w") as f:
+            f.write(key + "\n")
+
+    def first_run(self, keep_originals):
+        m = self.m
+        m.KEEP_ORIGINALS = keep_originals
+        m.MIN_SIZE_MB, m.MIN_AGE_MINUTES, m.STABLE_CHECK_SECONDS = 0, 0, 0
+        m.setup_logging()
+        self.src = self.record("Show_Name/S1_E2_-_Pilot_-_Mon_09_Nov.mpeg")
+        self.key = m.rel(self.src)
+        self.assertEqual(m.run(self.args(), m.load_state()), 0)
+        self.filed = os.path.join(m.TV_DIR, "Show Name", "Season 1", "Show Name - S01E02 - Pilot.mp4")
+        self.assertTrue(os.path.exists(self.filed))
+        with open(self.filed, "ab") as f:                    # so the first copy is recognisable
+            f.write(b"old copy")
+        self.old_size = os.path.getsize(self.filed)
+
+    def test_original_still_there_is_converted_again_and_replaces_the_library_copy(self):
+        m = self.m
+        self.first_run(keep_originals=True)
+        self.request(self.key)
+        self.assertEqual(m.run(self.args(), m.load_state()), 0)
+        self.assertNotEqual(os.path.getsize(self.filed), self.old_size)
+        entry = m.load_state()["files"][self.key]
+        self.assertEqual(entry["filed"], m.media_rel(self.filed))
+        self.assertNotIn("redo", entry)
+        self.assertNotIn("replace", entry)
+        self.assertEqual(os.listdir(m.REDO_REQUESTS_DIR), [])
+        # and without a request, the next run leaves it alone
+        self.assertEqual(m.choose(m.load_state())[0], [])
+
+    def test_deleted_original_is_asked_for_then_converted_when_it_arrives(self):
+        m = self.m
+        self.first_run(keep_originals=False)
+        self.assertFalse(os.path.exists(self.src))
+        self.request(self.key)
+        self.assertEqual(m.run(self.args(), m.load_state()), 0)
+        refetch = os.path.join(m.SOURCE_DIR, m.REFETCH_LIST)
+        with open(refetch) as f:
+            self.assertEqual(f.read(), self.key + "\n")
+        self.assertEqual(os.path.getsize(self.filed), self.old_size)      # old copy stays meanwhile
+        os.remove(refetch)                                                # the download script's part
+        self.record("Show_Name/S1_E2_-_Pilot_-_Mon_09_Nov.mpeg")
+        self.assertEqual(m.run(self.args(), m.load_state()), 0)
+        self.assertNotEqual(os.path.getsize(self.filed), self.old_size)
+        self.assertFalse(os.path.exists(self.src))
+
+    def test_cancel_and_no_longer_on_the_box(self):
+        m = self.m
+        self.first_run(keep_originals=False)
+        self.request(self.key)
+        m.run(self.args(), m.load_state())
+        self.request(self.key, "remove")
+        m.run(self.args(), m.load_state())
+        self.assertFalse(os.path.exists(os.path.join(m.SOURCE_DIR, m.REFETCH_LIST)))
+        self.assertNotIn("redo", m.load_state()["files"][self.key])
+        self.request(self.key)
+        m.run(self.args(), m.load_state())
+        with open(os.path.join(m.SOURCE_DIR, m.REFETCH_FAILED), "w") as f:
+            f.write(self.key + "\n")
+        m.run(self.args(), m.load_state())
+        self.assertNotIn("redo", m.load_state()["files"][self.key])
+        self.assertIn("no longer on the Fetch box", m.notifications[-1])
+        self.assertEqual(os.path.getsize(self.filed), self.old_size)
+
+
 class StalledCopy(Base):
     def test_copy_file_copies(self):
         src = os.path.join(self.tmp, "a")
@@ -384,8 +462,8 @@ class StatusPage(Base):
             "Show/c.mpeg": {"status": "done", "filed": "TV/Show/Season 1/Show - S01E03.mp4", "ads": "pending"}}})
         text = self.s.page(self.s.snapshot())
         self.assertIn('value="Show/a.mpeg"', text)                 # offered again: a rescan
-        self.assertNotIn('value="Show/b.mpeg"', text)              # not in the library
-        self.assertNotIn('class="pick" form="ads" name="key" value="Show/c.mpeg"', text)   # already queued
+        self.assertIn('value="Show/b.mpeg" data-noads', text)      # not in the library: convert again only
+        self.assertIn('value="Show/c.mpeg" data-noads', text)      # already queued
         self.assertFalse(self.s.request_ads(["Show/b.mpeg", "nonsense"]))
         self.assertEqual(self.kicks, [])
         self.assertTrue(self.s.request_ads(["Show/a.mpeg", "Show/b.mpeg"]))
@@ -410,7 +488,21 @@ class StatusPage(Base):
         self.assertEqual(m.take_ad_requests(state), 0)
         self.assertEqual(state["files"]["Show/c.mpeg"]["ads"], "scanning")
         m.PLEX_ADS = False
-        self.assertNotIn('class="pick"', self.s.page(self.s.snapshot()))
+        self.assertNotIn('id="go"', self.s.page(self.s.snapshot()))
+
+    def test_convert_again_request_and_cancel(self):
+        m = self.m
+        m.save_state({"files": {"Show/a.mpeg": {"status": "done", "filed": "TV/Show/Season 1/Show - S01E01.mp4"},
+                                "Show/f.mpeg": {"status": "failed", "failures": 1}}})
+        self.assertFalse(self.s.request_redo(["Show/f.mpeg", "nonsense"]))
+        self.assertTrue(self.s.request_redo(["Show/a.mpeg"]))
+        self.assertEqual(list(m.read_requests()), ["Show/a.mpeg"])           # acted on straight away
+        text = self.s.page(self.s.snapshot())
+        self.assertIn("Converting again (1)", text)
+        self.assertIn('action="/redo/remove"', text)
+        self.assertNotIn('class="pick" form="ads" name="key" value="Show/a.mpeg"', text)
+        self.assertTrue(self.s.request_redo(["Show/a.mpeg"], remove=True))
+        self.assertNotIn("Converting again", self.s.page(self.s.snapshot()))
 
 
 if __name__ == "__main__":
