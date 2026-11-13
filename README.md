@@ -134,7 +134,8 @@ Recordings are expected in the layout fetchtv-cli saves:
   one for ads, with a **Stop this run** button
 - whether the recordings folder is reachable
 - **Needs attention:** recordings that were given up on (with **Try again**), and MP4s
-  that weren't filed because the library already had that episode or film
+  that weren't filed because the library already had that episode or film (with **File
+  it now**, for when you've since deleted the library's copy). Each has **Remove**
 - **Ad detection queue** (with `[plex] detect_ads = yes`): the recording Plex is scanning
   and the ones lined up behind it. **Remove** takes one off the queue and puts back
   what was known about it; a scan that has started can't be interrupted
@@ -145,6 +146,11 @@ Recordings are expected in the layout fetchtv-cli saves:
   40, all of them, or only those not scanned. Tick recordings and press **Detect ads
   in selected** to queue them
 - **Convert again**, for ticked recordings whose MP4 came out wrong (see below)
+- **Remove**, for ticked recordings you want offair to forget, such as tests. The
+  record goes, along with anything left of it in the recordings folder (the original
+  and an unfiled MP4). Nothing in your libraries is touched, so delete the library's
+  copy in your media server if you want that gone too. The download script won't
+  fetch a removed recording again
 - the log, folded away at the bottom
 
 The page refreshes every minute, except while you have recordings ticked. It never converts anything itself: its buttons leave

@@ -83,6 +83,10 @@ def snapshot():
     state = core.load_state() if os.path.exists(core.STATE_FILE) else {"files": {}}
     files = state["files"]
     core.apply_ad_requests(files, core.read_ad_requests())     # show requests the job hasn't read yet
+    for _, refile, keys in core.read_ad_requests(core.TIDY_REQUESTS_DIR):
+        for key in keys:                                       # asked to be removed: gone already
+            if not refile:
+                files.pop(key, None)
     for _, add, keys in core.read_ad_requests(core.REDO_REQUESTS_DIR):
         for key in keys:
             if key in files and add:
@@ -131,6 +135,7 @@ def snapshot():
     done = [(e.get("converted_at", ""), k, e) for k, e in files.items() if e.get("status") == "done"]
     snap["recent"] = sorted(done, reverse=True)
     snap["total"] = len(done)
+    snap["known"] = set(files)
     # Converting again: (key, True if its original has to come from the Fetch box first)
     snap["redo"] = sorted((k, bool(snap["share"]) and not os.path.exists(os.path.join(core.SOURCE_DIR, k)))
                           for k, e in files.items() if e.get("redo"))
@@ -203,9 +208,15 @@ def name(key):
     return parts[0] if len(set(parts)) == 1 else " / ".join(parts)     # films: folder = title
 
 
-def button(action, label, key="", css=""):
-    return ('<form method="post" action="/%s"><input type="hidden" name="key" value="%s">'
-            '<button class="%s">%s</button></form>' % (action, esc(key), css, esc(label)))
+REMOVE_WARNING = ("Remove from Offair? Its record goes, along with anything left of it in the recordings "
+                  "folder. Nothing in your library is touched, and it won't be downloaded again.")
+
+
+def button(action, label, key="", css="", confirm=""):
+    return ('<form method="post" action="/%s"%s><input type="hidden" name="key" value="%s">'
+            '<button class="%s">%s</button></form>'
+            % (action, ' onsubmit="return confirm(\'%s\')"' % esc(confirm.replace("'", "\\'")) if confirm else "",
+               esc(key), css, esc(label)))
 
 
 def rows(items, action=None):
@@ -219,7 +230,8 @@ def rows(items, action=None):
 
 SCRIPT = """
 var boxes = document.querySelectorAll('input.pick'), all = document.getElementById('all'),
-    go = document.getElementById('go'), redo = document.getElementById('redo');
+    go = document.getElementById('go'), redo = document.getElementById('redo'),
+    forget = document.getElementById('forget');
 function update() {
   var n = document.querySelectorAll('input.pick:checked').length,
       ads = document.querySelectorAll('input.pick:checked:not([data-noads])').length;
@@ -229,6 +241,8 @@ function update() {
   }
   redo.disabled = !n;
   redo.textContent = n ? 'Convert ' + n + ' again' : 'Convert again';
+  forget.disabled = !n;
+  forget.textContent = n ? 'Remove ' + n : 'Remove';
   all.checked = n > 0 && n === boxes.length;
 }
 if (redo && all) {
@@ -238,6 +252,7 @@ if (redo && all) {
     return confirm('Convert the selected recording(s) again? Each new copy replaces the one in your ' +
                    'library. If the original was deleted, it is downloaded from the Fetch box again first.');
   };
+  forget.onclick = function () { return confirm('%s'); };
   update();
 }
 // Refresh every minute, but not while you're part-way through choosing.
@@ -314,7 +329,10 @@ def page(snap, view=""):
                     % (len(snap["attention"]), "".join(
                         '<tr><td>%s</td><td class="dim">%s</td><td class="act">%s</td></tr>'
                         % (esc(name(k)), esc(note),
-                           button("convert", "Try again", k) if note.startswith(("gave up", "failed")) and snap["share"] else "")
+                           (button("convert", "Try again", k) + " " if note.startswith(("gave up", "failed")) and snap["share"]
+                            else button("refile", "File it now", k) + " " if note.startswith("converted but not filed") and snap["share"]
+                            else "") + (button("forget", "Remove", k, css="quiet", confirm=REMOVE_WARNING)
+                                        if k in snap["known"] else ""))
                         for k, note in snap["attention"])))
 
     # The ad queue: what Plex is scanning and what's lined up, each removable.
@@ -380,7 +398,8 @@ def page(snap, view=""):
     body.append('<div class="card"><h2>Converted <span class="tabs">%s</span>%s</h2>%s</div>'
                 % (tabs,
                    '<span class="act"><form id="ads" method="post" action="/ads">%s<button id="redo" '
-                   'class="quiet" formaction="/redo" disabled>Convert again</button></form></span>'
+                   'class="quiet" formaction="/redo" disabled>Convert again</button> <button id="forget" '
+                   'class="quiet" formaction="/forget" disabled>Remove</button></form></span>'
                    % ('<button id="go" disabled>Detect ads in selected</button> ' if plex else ""),
                    '<table><tr><th>%sRecording</th><th>Converted</th>%s</tr>%s</table>'
                    % ('<input type="checkbox" id="all" title="Select all">',
@@ -391,7 +410,7 @@ def page(snap, view=""):
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Offair</title>'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             '<style>%s</style></head><body><main>%s</main><script>%s</script>'
-            '</body></html>' % (CSS, "".join(body), SCRIPT))
+            '</body></html>' % (CSS, "".join(body), SCRIPT % REMOVE_WARNING.replace("'", "\\'")))
 
 
 # ---------------------------------------------------------------- actions --
@@ -446,6 +465,22 @@ def request_redo(keys, remove=False):
     for i, key in enumerate([] if remove else keys):
         with open(os.path.join(core.REQUESTS_DIR, "redo-%.6f-%d" % (time.time(), i)), "w") as f:
             f.write(os.path.join(core.SOURCE_DIR, key) + "\n")
+    launchctl("kickstart")
+    return True
+
+
+def request_tidy(keys, refile=False):
+    """Ask for recordings (state keys) to be removed from offair's records, or for an
+    unfiled MP4 to be filed again, and start the job. Returns False if none is known."""
+    files = core.load_state()["files"]
+    keys = [k for k in keys if k in files]
+    if not keys:
+        return False
+    os.makedirs(core.TIDY_REQUESTS_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".new.", dir=core.TIDY_REQUESTS_DIR)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(keys) + "\n")
+    os.rename(tmp, os.path.join(core.TIDY_REQUESTS_DIR, "%.6f.%s" % (time.time(), "add" if refile else "remove")))
     launchctl("kickstart")
     return True
 
@@ -529,6 +564,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             core.load_config()
             if not request_redo(form.get("key", []), remove=self.path != "/redo"):
                 return self.send(400, "None of those is a converted recording.")
+        elif self.path in ("/forget", "/refile"):
+            core.load_config()
+            if not request_tidy(form.get("key", []), refile=self.path == "/refile"):
+                return self.send(400, "Offair has no record of that.")
         elif self.path == "/stop":
             launchctl("kill", "TERM")
         else:

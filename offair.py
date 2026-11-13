@@ -62,6 +62,7 @@ STATE_FILE = os.path.join(HOME, "Library/Application Support/offair/state.json")
 REQUESTS_DIR = os.path.join(HOME, "Library/Application Support/offair/requests")
 AD_REQUESTS_DIR = os.path.join(HOME, "Library/Application Support/offair/ad-requests")
 REDO_REQUESTS_DIR = os.path.join(HOME, "Library/Application Support/offair/redo-requests")
+TIDY_REQUESTS_DIR = os.path.join(HOME, "Library/Application Support/offair/tidy-requests")
 # In the recordings folder, for the download script (see extras/fetch-sync.sh): the
 # recordings to download again, and those it couldn't find on the box.
 REFETCH_LIST = "refetch-requests.txt"
@@ -959,6 +960,43 @@ def take_redo_requests(state):
             pass
 
 
+def take_tidy_requests(state):
+    """Apply the status page's other requests. "File it now" tries again to file an MP4
+    that was left beside its recording. "Remove" forgets a recording: its record goes,
+    and so does whatever is left of it in the recordings folder (the original and an
+    unfiled MP4). Nothing in the libraries is touched, and the download script won't
+    fetch it again."""
+    requests = read_ad_requests(TIDY_REQUESTS_DIR)
+    try:
+        for _, refile, keys in requests:
+            for key in keys:
+                entry = state["files"].get(key)
+                if entry is None:
+                    continue
+                if refile:
+                    if entry.get("filed", "").startswith("no"):
+                        del entry["filed"]
+                        log.info("Filing again: %s", key)
+                    continue
+                src = os.path.join(SOURCE_DIR, key)
+                for leftover in (src, mp4_path(src)):
+                    if os.path.exists(leftover):
+                        os.remove(leftover)
+                        log.info("Removed %s", rel(leftover))
+                edit_refetch_list(key, False)
+                del state["files"][key]
+                log.info("Removed from the records: %s", key)
+    except OSError as e:
+        log.warning("Could not apply status page requests (%s); will try again next run", e)
+        return
+    save_state(state)
+    for req, _, _ in requests:
+        try:
+            os.remove(req)
+        except OSError:
+            pass
+
+
 # --------------------------------------------------------------- Plex ads --
 # Plex only scans a library for ads when its "Ad detection" setting is "For all items",
 # and then it scans every item in it during maintenance: days of work for a small NAS.
@@ -1154,7 +1192,8 @@ def run(args, state):
     keep_going = lambda: args.force or only_requests or in_window()     # for the Plex step
     if requests:
         log.info("Convert-now request(s): %s", ", ".join(sorted(requests)))
-    page_requests = not args.dry_run and bool(read_ad_requests() or read_ad_requests(REDO_REQUESTS_DIR))
+    page_requests = not args.dry_run and bool(read_ad_requests() or read_ad_requests(REDO_REQUESTS_DIR)
+                                              or read_ad_requests(TIDY_REQUESTS_DIR))
     if page_requests and not (requests or args.force or in_window()):
         # The queue was changed on the status page. Plex does the work, so power and the
         # share don't matter; it stops when the window opens so that it never blocks the
@@ -1162,6 +1201,8 @@ def run(args, state):
         log.info("Outside run window %s-%s; only applying status page requests", RUN_START, RUN_END)
         if nas_reachable() and (share_mounted() or mount_share()) and os.path.isdir(SOURCE_DIR):
             take_redo_requests(state)
+            take_tidy_requests(state)
+            file_finished(state)
         plex_detect_ads(state, lambda: not in_window())
         return 0
 
@@ -1206,6 +1247,7 @@ def run(args, state):
 
     if not args.dry_run:
         take_redo_requests(state)
+        take_tidy_requests(state)
     candidates, skipped, clashes = choose(state, requests, only_requests)
     chosen = {request_key(src) for src, _ in candidates}
     reasons = {request_key(src): reason for src, reason in skipped}
@@ -1507,8 +1549,8 @@ def main():
             # A request made while this run was busy found the job already running.
             new = {f for fs in read_requests().values() for f in fs} - seen
             try:
-                more_ads = any(not n.startswith(".") for n in os.listdir(AD_REQUESTS_DIR))
-            except FileNotFoundError:
+                more_ads = bool(read_ad_requests() or read_ad_requests(TIDY_REQUESTS_DIR))
+            except OSError:
                 more_ads = False
             if args.dry_run or not (new or more_ads):
                 return rc

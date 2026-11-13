@@ -32,6 +32,7 @@ def load():
     m.REQUESTS_DIR = os.path.join(tmp, "state", "requests")
     m.AD_REQUESTS_DIR = os.path.join(tmp, "state", "ad-requests")
     m.REDO_REQUESTS_DIR = os.path.join(tmp, "state", "redo-requests")
+    m.TIDY_REQUESTS_DIR = os.path.join(tmp, "state", "tidy-requests")
     m.LOG_FILE = os.path.join(tmp, "offair.log")
     m.LOCK_DIR = os.path.join(m.WORK_DIR, "run.lock")
     m.FFMPEG_LOG = os.path.join(m.WORK_DIR, "ffmpeg-last.log")
@@ -489,6 +490,33 @@ class StatusPage(Base):
         self.assertEqual(state["files"]["Show/c.mpeg"]["ads"], "scanning")
         m.PLEX_ADS = False
         self.assertNotIn('id="go"', self.s.page(self.s.snapshot()))
+
+    def test_remove_and_file_again(self):
+        m = self.m
+        m.setup_logging()
+        src = touch(os.path.join(m.SOURCE_DIR, "Show", "S1_E1_-_Test.mpeg"))
+        mp4 = touch(m.mp4_path(src))
+        other = touch(os.path.join(m.SOURCE_DIR, "Show", "S1_E2_-_Unfiled.mpeg"))
+        touch(m.mp4_path(other))
+        in_library = touch(os.path.join(m.TV_DIR, "Show", "Season 1", "Show - S01E01 - Test.mp4"))
+        m.save_state({"files": {
+            m.rel(src): {"status": "done", "filed": "no, already in library: TV/Show/Season 1/x.mp4"},
+            m.rel(other): {"status": "done", "filed": "no, already in library: TV/Show/Season 1/y.mp4"}}})
+        text = self.s.page(self.s.snapshot())
+        self.assertIn('action="/forget"', text)
+        self.assertIn('action="/refile"', text)
+        self.assertFalse(self.s.request_tidy(["nonsense"]))
+        self.assertTrue(self.s.request_tidy([m.rel(src)]))
+        self.assertTrue(self.s.request_tidy([m.rel(other)], refile=True))
+        self.assertNotIn("S1 E1 - Test", self.s.page(self.s.snapshot()))       # gone from the page at once
+        state = m.load_state()
+        m.take_tidy_requests(state)
+        self.assertEqual(list(state["files"]), [m.rel(other)])
+        self.assertFalse(os.path.exists(src) or os.path.exists(mp4))
+        self.assertTrue(os.path.exists(in_library))                             # the library is never touched
+        m.file_finished(state)
+        self.assertEqual(state["files"][m.rel(other)]["filed"], "TV/Show/Season 1/Show - S01E02 - Unfiled.mp4")
+        self.assertEqual(os.listdir(m.TIDY_REQUESTS_DIR), [])
 
     def test_other_devices_need_the_password(self):
         import base64
