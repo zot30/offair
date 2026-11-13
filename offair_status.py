@@ -10,10 +10,13 @@ The page never converts anything itself. "Convert now" leaves the same request f
 the Finder Quick Action and starts the nightly job, so the work is done the usual way.
 """
 
+import base64
 import datetime
+import hmac
 import html
 import http.server
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -456,11 +459,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
     cache = (0.0, None)
 
     def local(self):
-        """Only this Mac's own browser, on this page: refuses other sites' forms and
-        addresses that merely point here."""
+        """Who may use the page. This Mac's own browser, at this page's own address, always:
+        that refuses other sites' forms and addresses that merely point here. With
+        [status] on_network, anything else is let in with the password."""
         hosts = {"localhost:%d" % core.STATUS_PORT, "127.0.0.1:%d" % core.STATUS_PORT}
-        origin = self.headers.get("Origin")
-        return self.headers.get("Host") in hosts and (origin is None or origin in {"http://" + h for h in hosts})
+        host, origin = self.headers.get("Host"), self.headers.get("Origin")
+        if origin is not None and origin != "http://%s" % host:
+            return False                            # a form on some other site
+        if self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1") and host in hosts:
+            return True
+        if not (core.STATUS_ON_NETWORK and core.STATUS_PASSWORD):
+            return False
+        try:
+            kind, _, given = (self.headers.get("Authorization") or "").partition(" ")
+            password = base64.b64decode(given).decode("utf-8", "replace").partition(":")[2]
+        except ValueError:
+            password = ""
+        if kind == "Basic" and hmac.compare_digest(password.encode(), core.STATUS_PASSWORD.encode()):
+            return True
+        self.ask_password = True
+        return False
+
+    def refuse(self):
+        if getattr(self, "ask_password", False):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Offair", charset="UTF-8"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self.send(403, "Forbidden")
 
     def send(self, code, text="", location=None):
         data = text.encode()
@@ -475,7 +502,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if not self.local():
-            return self.send(403, "Forbidden")
+            return self.refuse()
         views = {"/" + ("?show=" + v if v else ""): v for v, _ in VIEWS}
         if self.path not in views:
             return self.send(404, "Not found")
@@ -487,7 +514,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self.local():
-            return self.send(403, "Forbidden")
+            return self.refuse()
         length = min(int(self.headers.get("Content-Length") or 0), 10000)
         form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
         if self.path == "/convert":
@@ -516,7 +543,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main():
     core.load_config()
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", core.STATUS_PORT), Handler)
+    if core.STATUS_ON_NETWORK and core.STATUS_PASSWORD:
+        class Server(http.server.ThreadingHTTPServer):         # IPv4 and IPv6, every interface
+            address_family = socket.AF_INET6
+
+            def server_bind(self):
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                super().server_bind()
+        server = Server(("::", core.STATUS_PORT), Handler)
+    else:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", core.STATUS_PORT), Handler)
     print("offair status page: http://localhost:%d" % core.STATUS_PORT, flush=True)
     server.serve_forever()
 

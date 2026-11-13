@@ -490,6 +490,31 @@ class StatusPage(Base):
         m.PLEX_ADS = False
         self.assertNotIn('id="go"', self.s.page(self.s.snapshot()))
 
+    def test_other_devices_need_the_password(self):
+        import base64
+        m = self.m
+
+        def allowed(client, host, password=None, origin=None):
+            h = self.s.Handler.__new__(self.s.Handler)
+            h.client_address = (client, 5)
+            h.headers = {"Host": host}
+            if origin:
+                h.headers["Origin"] = origin
+            if password is not None:
+                h.headers["Authorization"] = "Basic " + base64.b64encode(("me:" + password).encode()).decode()
+            return h.local()
+        here = "localhost:%d" % m.STATUS_PORT
+        self.assertTrue(allowed("127.0.0.1", here))
+        self.assertFalse(allowed("192.168.1.9", "mac.local:8765", "secret-word"))      # off by default
+        self.assertFalse(allowed("127.0.0.1", "evil.example:8765"))                    # merely points here
+        m.STATUS_ON_NETWORK, m.STATUS_PASSWORD = True, "secret-word"
+        self.assertTrue(allowed("192.168.1.9", "mac.local:8765", "secret-word"))
+        self.assertFalse(allowed("192.168.1.9", "mac.local:8765", "wrong"))
+        self.assertFalse(allowed("192.168.1.9", "mac.local:8765"))
+        self.assertFalse(allowed("127.0.0.1", "evil.example:8765"))
+        self.assertFalse(allowed("192.168.1.9", "mac.local:8765", "secret-word", origin="http://evil.example"))
+        self.assertTrue(allowed("192.168.1.9", "mac.local:8765", "secret-word", origin="http://mac.local:8765"))
+
     def test_convert_again_request_and_cancel(self):
         m = self.m
         m.save_state({"files": {"Show/a.mpeg": {"status": "done", "filed": "TV/Show/Season 1/Show - S01E01.mp4"},

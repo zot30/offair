@@ -152,6 +152,12 @@ a request for the nightly job, exactly like the Quick Action below. Stopping a r
 ends it cleanly, and the recording is tried again next time.
 
 Only this Mac can open the page, and it refuses requests sent from other websites.
+To use it from a phone or another computer at home, set `[status] on_network = yes` and
+a `password`, run `./offair.py install` again, and open
+`http://<this-mac's-name>.local:8765` (the name is under System Settings → General →
+Sharing → Local hostname). Other devices are asked for the password; any user name
+works. The page is only reachable while the Mac is awake, and the password travels
+unencrypted, so use this on a network you trust.
 Change the port with `[status] port`, then run `./offair.py install` again.
 
 ## Convert again
