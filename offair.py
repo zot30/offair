@@ -117,7 +117,8 @@ COPY_STALL_MINUTES = 10            # stop the run if a copy makes no progress fo
 # Status page (offair_status.py), on this Mac only: http://localhost:<port>
 STATUS_PORT = 8765
 STATUS_ON_NETWORK = False          # let other devices on the local network open the status page
-STATUS_PASSWORD = ""               # which they must give; required while that is on
+STATUS_PASSWORD = ""               # if set, they must give it
+STATUS_COPY_TO = ""                # folder to keep a read-only copy of the page in, for a web server
 
 # Plex's own ad detection, which gives a Skip Commercials button (see README).
 PLEX_ADS = False
@@ -151,7 +152,7 @@ CONFIG_KEYS = {
     "notifications": {"title": ("NOTIFY_TITLE", "text"),
                       "share_down_nights": ("SHARE_DOWN_ALERT_NIGHTS", "int")},
     "status": {"port": ("STATUS_PORT", "int"), "on_network": ("STATUS_ON_NETWORK", "bool"),
-               "password": ("STATUS_PASSWORD", "text")},
+               "password": ("STATUS_PASSWORD", "text"), "copy_to": ("STATUS_COPY_TO", "path")},
     "plex": {"detect_ads": ("PLEX_ADS", "bool"), "url": ("PLEX_URL", "text"),
              "token_file": ("PLEX_TOKEN_FILE", "path")},
 }
@@ -229,8 +230,8 @@ def load_config(path=None):
         problems.append("[folders] tv and movies must be set (or set [files] file_into_library = no)")
     if not SOURCE_EXTENSIONS or not all(e.startswith(".") for e in SOURCE_EXTENSIONS):
         problems.append("[folders] extensions must be a list like .mpeg, .ts")
-    if STATUS_ON_NETWORK and len(STATUS_PASSWORD) < 6:
-        problems.append("[status] password must be set (6 characters or more) while on_network = yes")
+    if STATUS_PASSWORD and len(STATUS_PASSWORD) < 6:
+        problems.append("[status] password must be 6 characters or more")
     if PLEX_ADS and not PLEX_URL.startswith(("http://", "https://")):
         problems.append("[plex] url must be set, like http://nas.local:32400, while detect_ads = yes")
     if PLEX_ADS and not FILE_INTO_LIBRARY:

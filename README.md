@@ -158,12 +158,18 @@ a request for the nightly job, exactly like the Quick Action below. Stopping a r
 ends it cleanly, and the recording is tried again next time.
 
 Only this Mac can open the page, and it refuses requests sent from other websites.
-To use it from a phone or another computer at home, set `[status] on_network = yes` and
-a `password`, run `./offair.py install` again, and open
-`http://<this-mac's-name>.local:8765` (the name is under System Settings → General →
-Sharing → Local hostname). Other devices are asked for the password; any user name
-works. The page is only reachable while the Mac is awake, and the password travels
-unencrypted, so use this on a network you trust.
+To use it from a phone or another computer at home, set `[status] on_network = yes`,
+run `./offair.py install` again, and open `http://<this-mac's-name>.local:8765` (the
+name is under System Settings → General → Sharing → Local hostname). Anyone on your
+network can then press its buttons. To prevent that, also set a `password`: other
+devices are asked for it, and any user name works. It travels unencrypted, so use it
+on a network you trust. The page is only reachable while the Mac is awake.
+
+For a page that is always there, set `[status] copy_to` to a folder that a web server
+serves, such as one on your NAS. Offair keeps a read-only copy of the page there
+(`index.html`), refreshed within a minute of anything changing while the Mac is awake
+and the folder is reachable. The copy has no buttons, says when it was last updated,
+and links to the Mac's page if `on_network` is on.
 Change the port with `[status] port`, then run `./offair.py install` again.
 
 ## Convert again

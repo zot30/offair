@@ -542,6 +542,22 @@ class StatusPage(Base):
         self.assertFalse(allowed("127.0.0.1", "evil.example:8765"))
         self.assertFalse(allowed("192.168.1.9", "mac.local:8765", "secret-word", origin="http://evil.example"))
         self.assertTrue(allowed("192.168.1.9", "mac.local:8765", "secret-word", origin="http://mac.local:8765"))
+        m.STATUS_PASSWORD = ""                               # no password: home-network addresses only
+        self.assertTrue(allowed("192.168.1.9", "mac.local:8765"))
+        self.assertTrue(allowed("192.168.1.9", "192.168.1.5:8765", origin="http://192.168.1.5:8765"))
+        self.assertFalse(allowed("192.168.1.9", "evil.example:8765", origin="http://evil.example:8765"))
+        self.assertFalse(allowed("192.168.1.9", "mac.local:8765", origin="http://evil.example"))
+
+    def test_read_only_copy(self):
+        m = self.m
+        m.save_state({"files": {"Show/a.mpeg": {"status": "done", "filed": "TV/Show/Season 1/Show - S01E01.mp4"}}})
+        m.PLEX_ADS, m.STATUS_ON_NETWORK = True, True
+        self.assertIn("<form", self.s.page(self.s.snapshot()))
+        text = self.s.static_page(self.s.snapshot())
+        for gone in ("<form", "<input", "<button", "?show="):
+            self.assertNotIn(gone, text)
+        for kept in ("Read-only copy", "Make changes on the Mac", "Not scanned", "Season 1"):
+            self.assertIn(kept, text)
 
     def test_convert_again_request_and_cancel(self):
         m = self.m

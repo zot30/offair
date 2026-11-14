@@ -3,8 +3,10 @@
 with buttons to convert a recording now, stop a run, or queue recordings for Plex's ad
 detection.
 
-It serves http://localhost:<port> (see [status] port) to this Mac only. `offair.py
-install` sets it up to run all the time; to try it by hand, run this file.
+It serves http://localhost:<port> (see [status] port) to this Mac only, or to the local
+network with [status] on_network. With [status] copy_to it also keeps a read-only copy
+of the page in that folder, for a web server to serve. `offair.py install` sets it up
+to run all the time; to try it by hand, run this file.
 
 The page never converts anything itself. "Convert now" leaves the same request file as
 the Finder Quick Action and starts the nightly job, so the work is done the usual way.
@@ -15,11 +17,14 @@ import datetime
 import hmac
 import html
 import http.server
+import ipaddress
 import os
+import re
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 
@@ -413,6 +418,49 @@ def page(snap, view=""):
             '</body></html>' % (CSS, "".join(body), SCRIPT % REMOVE_WARNING.replace("'", "\\'")))
 
 
+def static_page(snap):
+    """The page as a read-only file for a web server to serve: nothing to press."""
+    text = re.sub(r'<form\b.*?</form>|<input\b[^>]*>|<span class="tabs">.*?</span>|<script>.*?</script>',
+                  "", page(snap, "all"), flags=re.S)
+    mac = subprocess.run(["scutil", "--get", "LocalHostName"], capture_output=True, text=True).stdout.strip()
+    link = (' <a href="http://%s.local:%d">Make changes on the Mac</a> (while it\'s awake).'
+            % (esc(mac), core.STATUS_PORT) if core.STATUS_ON_NETWORK and mac else "")
+    note = '<div class="dim">Read-only copy, updated <!--at-->.%s</div>' % link
+    return text.replace("<h1>Offair</h1>", "<h1>Offair</h1>" + note, 1).replace(
+        "</body>", "<script>setInterval(function () { location.reload(); }, 60000);</script></body>", 1)
+
+
+def keep_copy():
+    """Keep the read-only copy in [status] copy_to up to date. It looks at the share only
+    when something has changed on this Mac, so an idle NAS is left to sleep."""
+    def mtime(path):
+        try:
+            return os.stat(path).st_mtime
+        except OSError:
+            return 0
+    seen = last = None
+    while True:
+        try:
+            core.load_config()
+            folder = core.STATUS_COPY_TO
+            there = bool(folder) and os.path.isdir(os.path.dirname(folder))     # its share is connected
+            sig = (datetime.date.today(), running_pid(), there) + tuple(mtime(p) for p in (
+                core.CONFIG_FILE, core.STATE_FILE, core.LOG_FILE, core.REQUESTS_DIR, core.AD_REQUESTS_DIR,
+                core.REDO_REQUESTS_DIR, core.TIDY_REQUESTS_DIR))
+            if there and sig != seen:
+                text = static_page(snapshot())
+                if text != last:
+                    os.makedirs(folder, exist_ok=True)
+                    tmp = os.path.join(folder, ".index.new")
+                    with open(tmp, "w") as f:
+                        f.write(text.replace("<!--at-->", datetime.datetime.now().strftime("%a %d %b %H:%M")))
+                    os.replace(tmp, os.path.join(folder, "index.html"))
+                seen, last = sig, text
+        except OSError:
+            pass                                    # the share went away mid-write: try again next minute
+        time.sleep(60)
+
+
 # ---------------------------------------------------------------- actions --
 
 def request_convert(key):
@@ -496,15 +544,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def local(self):
         """Who may use the page. This Mac's own browser, at this page's own address, always:
         that refuses other sites' forms and addresses that merely point here. With
-        [status] on_network, anything else is let in with the password."""
+        [status] on_network, anything else is let in with the password, or, if none is
+        set, at a home-network address (so a website can't point its own name here)."""
         hosts = {"localhost:%d" % core.STATUS_PORT, "127.0.0.1:%d" % core.STATUS_PORT}
         host, origin = self.headers.get("Host"), self.headers.get("Origin")
         if origin is not None and origin != "http://%s" % host:
             return False                            # a form on some other site
         if self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1") and host in hosts:
             return True
-        if not (core.STATUS_ON_NETWORK and core.STATUS_PASSWORD):
+        if not core.STATUS_ON_NETWORK:
             return False
+        if not core.STATUS_PASSWORD:
+            name = (host or "").rsplit(":", 1)[0].lower()
+            if name.endswith((".local", ".lan", ".home", ".home.arpa", ".internal")) or "." not in name:
+                return bool(name)
+            try:
+                return bool(ipaddress.ip_address(name))
+            except ValueError:
+                return False
         try:
             kind, _, given = (self.headers.get("Authorization") or "").partition(" ")
             password = base64.b64decode(given).decode("utf-8", "replace").partition(":")[2]
@@ -582,7 +639,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main():
     core.load_config()
-    if core.STATUS_ON_NETWORK and core.STATUS_PASSWORD:
+    threading.Thread(target=keep_copy, daemon=True).start()
+    if core.STATUS_ON_NETWORK:
         class Server(http.server.ThreadingHTTPServer):         # IPv4 and IPv6, every interface
             address_family = socket.AF_INET6
 
