@@ -1122,10 +1122,11 @@ def take_ad_requests(state):
     return changed
 
 
-def plex_detect_ads(state, keep_going=lambda: True):
+def plex_detect_ads(state, keep_going=lambda: True, finish_scan=False):
     """Have Plex find the ad breaks in newly filed recordings and any queued on the
-    status page. Whatever goes wrong here is logged and tried again next run; it never
-    affects a conversion."""
+    status page. No scan is started once keep_going() is false; with finish_scan, one
+    already started is still waited for, since Plex finishes it either way. Whatever
+    goes wrong here is logged and tried again next run; it never affects a conversion."""
     left = set()                                 # tried in this run
 
     def queued():
@@ -1168,10 +1169,10 @@ def plex_detect_ads(state, keep_going=lambda: True):
                 save_state(state)
                 log.info("Plex is scanning %s for ad breaks", entry["filed"])
                 deadline = time.time() + max(300, item.get("duration", 0) / 1000 * PLEX_SCAN_FACTOR)
-                while (not breaks or breaks == stale) and time.time() < deadline and keep_going():
+                while (not breaks or breaks == stale) and time.time() < deadline and (finish_scan or keep_going()):
                     time.sleep(PLEX_POLL_SECONDS)
                     breaks = plex_item(item_id)[1]
-            if (not breaks or breaks == stale) and not keep_going():
+            if (not breaks or breaks == stale) and not (finish_scan or keep_going()):
                 log.info("Run window has opened or closed; ad detection carries over to the next run")
                 return
             entry["ads"] = "%d ad break(s)" % len(breaks) if breaks else "none found"
@@ -1193,8 +1194,10 @@ def run(args, state):
     keep_going = lambda: args.force or only_requests or in_window()     # for the Plex step
     if requests:
         log.info("Convert-now request(s): %s", ", ".join(sorted(requests)))
+    # A scan left unread by a run that was stopped is picked up the same way.
     page_requests = not args.dry_run and bool(read_ad_requests() or read_ad_requests(REDO_REQUESTS_DIR)
-                                              or read_ad_requests(TIDY_REQUESTS_DIR))
+                                              or read_ad_requests(TIDY_REQUESTS_DIR)
+                                              or any(e.get("ads") == "scanning" for e in state["files"].values()))
     if page_requests and not (requests or args.force or in_window()):
         # The queue was changed on the status page. Plex does the work, so power and the
         # share don't matter; it stops when the window opens so that it never blocks the
@@ -1281,7 +1284,7 @@ def run(args, state):
     if not candidates:
         log.info("Nothing to convert (%d file(s) skipped)", len(skipped))
         file_finished(state)
-        plex_detect_ads(state, keep_going)
+        plex_detect_ads(state, keep_going, finish_scan=True)
         return 0
     log.info("%d file(s) to convert", len(candidates))
     for leftover in os.listdir(WORK_DIR):        # from a run that was killed mid-encode
@@ -1347,7 +1350,7 @@ def run(args, state):
     finally:
         caffeinate.terminate()
     log.info("Finished: %d converted", done)
-    plex_detect_ads(state, keep_going)
+    plex_detect_ads(state, keep_going, finish_scan=True)
     return 0
 
 

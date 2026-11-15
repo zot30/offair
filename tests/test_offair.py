@@ -401,6 +401,14 @@ class PlexAds(Base):
         self.m.plex_detect_ads(self.state)
         self.assertEqual(self.state["files"]["Show/S1_E2.mpeg"]["ads"], "none found")
 
+    def test_scan_under_way_when_the_window_closes_is_still_read(self):
+        closes = lambda: not getattr(self, "scanned", False)       # the window closes as the scan starts
+        self.m.plex_detect_ads(self.state, closes)
+        self.assertEqual(self.state["files"]["Show/S1_E2.mpeg"]["ads"], "scanning")
+        self.scanned = False
+        self.m.plex_detect_ads(self.state, closes, finish_scan=True)
+        self.assertEqual(self.state["files"]["Show/S1_E2.mpeg"]["ads"], "3 ad break(s)")
+
     def test_off_by_default_and_only_for_pending(self):
         self.state["files"]["Show/S1_E2.mpeg"]["ads"] = "none found"
         self.m.plex_detect_ads(self.state)
